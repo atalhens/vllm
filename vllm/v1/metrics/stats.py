@@ -156,6 +156,7 @@ class SchedulerStats:
 
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    num_corrupted_reqs: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
@@ -168,8 +169,6 @@ class SchedulerStats:
 
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
-
-    num_corrupted_reqs: int = 0
 
 
 @dataclass

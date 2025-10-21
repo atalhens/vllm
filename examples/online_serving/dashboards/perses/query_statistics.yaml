@@ -85,6 +85,20 @@ spec:
                   datasource: { kind: PrometheusDatasource, name: accelerators-thanos-querier-datasource }
                   query: sum(vllm:num_requests_waiting{namespace="$NS",service="$SVC"}) or vector(0)
                   minStep: "15s"
+    core_corrupted_now:
+      kind: Panel
+      spec:
+        display: { name: Corrupted Requests (now) }
+        plugin: { kind: StatChart, spec: { calculation: last-number } }
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  datasource: { kind: PrometheusDatasource, name: accelerators-thanos-querier-datasource }
+                  query: sum(vllm:num_requests_corrupted{namespace="$NS",service="$SVC"}) or vector(0)
+                  minStep: "15s"
 
     core_kv_usage_now:
       kind: Panel

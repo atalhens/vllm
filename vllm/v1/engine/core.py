@@ -98,6 +98,9 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self.include_corrupted_requests = (
+            vllm_config.scheduler_config.include_corrupted_requests
+        )
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -1054,7 +1057,7 @@ class DPEngineCoreProc(EngineCoreProc):
         # finished with DP peers every N steps.
         self.step_counter = 0
         self.current_wave = 0
-        self.last_counts = (0, 0)
+        self.last_counts = (0, 0, 0)
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
