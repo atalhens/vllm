@@ -137,12 +137,6 @@ class SchedulerConfig:
     structured outputs, speculative decoding, and pipeline parallelism.
     """
 
-    include_corrupted_requests: bool = False
-    """If set to True, include corrupted requests in scheduler statistics.
-    This adds computational overhead but provides more detailed metrics for
-    monitoring and debugging purposes.
-    """
-
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

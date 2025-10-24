@@ -124,7 +124,6 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
-        self.corrupted: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1162,22 +1161,9 @@ class Scheduler(SchedulerInterface):
             else:
                 request.spec_token_ids = spec_token_ids
 
-    def _get_corrupted_requests_count(self, include_corrupted: bool) -> int:
-        """Get the count of corrupted requests if enabled, otherwise return 0.
-
-        This method centralizes the corrupted requests counting logic to avoid
-        code duplication and improve performance.
-        """
-        if not include_corrupted:
-            return 0
-        return sum(req.is_output_corrupted for req in self.running)
-
-    def get_request_counts(self) -> tuple[int, int, int]:
-        """Returns (num_running_reqs, num_waiting_reqs, num_corrupted_reqs)."""
-        num_corrupted_reqs = self._get_corrupted_requests_count(
-            self.scheduler_config.include_corrupted_requests
-        )
-        return len(self.running), len(self.waiting), num_corrupted_reqs
+    def get_request_counts(self) -> tuple[int, int]:
+        """Returns (num_running_reqs, num_waiting_reqs)."""
+        return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
         self.waiting.add_request(request)
@@ -1271,7 +1257,6 @@ class Scheduler(SchedulerInterface):
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
-            num_corrupted_reqs=num_corrupted_reqs,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

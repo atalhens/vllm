@@ -187,7 +187,6 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s",
             "Running: %d reqs",
             "Waiting: %d reqs",
-            "Corrupted: %d reqs",
             "GPU KV cache usage: %.1f%%",
             "Prefix cache hit rate: %.1f%%",
         ]
@@ -196,7 +195,6 @@ class LoggingStatLogger(StatLoggerBase):
             self.last_generation_throughput,
             self.last_scheduler_stats.num_running_reqs,
             self.last_scheduler_stats.num_waiting_reqs,
-            self.last_scheduler_stats.num_corrupted_reqs,
             self.last_scheduler_stats.kv_cache_usage * 100,
             self.prefix_caching_metrics.hit_rate * 100,
         ]
@@ -270,9 +268,6 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
             )
             self.last_scheduler_stats.num_running_reqs += (
                 last_scheduler_stats.num_running_reqs
-            )
-            self.last_scheduler_stats.num_corrupted_reqs += (
-                last_scheduler_stats.num_corrupted_reqs
             )
             self.last_scheduler_stats.kv_cache_usage += (
                 last_scheduler_stats.kv_cache_usage
@@ -385,16 +380,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.gauge_scheduler_waiting = make_per_engine(
             gauge_scheduler_waiting, engine_indexes, model_name
-        )
-
-        gauge_scheduler_corrupted = self._gauge_cls(
-            name="vllm:num_requests_corrupted",
-            documentation="Number of requests corrupted.",
-            multiprocess_mode="mostrecent",
-            labelnames=labelnames,
-        )
-        self.gauge_scheduler_corrupted = make_per_engine(
-            gauge_scheduler_corrupted, engine_indexes, model_name
         )
 
         #
@@ -910,23 +895,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_scheduler_waiting[engine_idx].set(
                 scheduler_stats.num_waiting_reqs
             )
-            self.gauge_scheduler_corrupted[engine_idx].set(
-                scheduler_stats.num_corrupted_reqs
-            )
 
             if self.show_hidden_metrics:
                 self.gauge_gpu_cache_usage[engine_idx].set(
                     scheduler_stats.kv_cache_usage
                 )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
-
-            if self.show_hidden_metrics:
-                self.counter_gpu_prefix_cache_queries[engine_idx].inc(
-                    scheduler_stats.prefix_cache_stats.queries
-                )
-                self.counter_gpu_prefix_cache_hits[engine_idx].inc(
-                    scheduler_stats.prefix_cache_stats.hits
-                )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

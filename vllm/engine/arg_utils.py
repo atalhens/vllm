@@ -550,7 +550,6 @@ class EngineArgs:
     """Custom logitproc types"""
 
     async_scheduling: bool = SchedulerConfig.async_scheduling
-    include_corrupted_requests: bool = SchedulerConfig.include_corrupted_requests
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
 
@@ -1041,10 +1040,6 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--async-scheduling", **scheduler_kwargs["async_scheduling"]
-        )
-        scheduler_group.add_argument(
-            "--include-corrupted-requests",
-            **scheduler_kwargs["include_corrupted_requests"],
         )
 
         # Compilation arguments
@@ -1591,7 +1586,6 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
-            include_corrupted_requests=self.include_corrupted_requests,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

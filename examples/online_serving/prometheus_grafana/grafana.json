@@ -593,22 +593,6 @@
           "range": true,
           "refId": "C",
           "useBackend": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "vllm:num_requests_corrupted{model_name=\"$model_name\"}",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
-          "instant": false,
-          "legendFormat": "Num Corrupted",
-          "range": true,
-          "refId": "D",
-          "useBackend": false
         }
       ],
       "title": "Scheduler State",
