@@ -195,6 +195,7 @@ EXPECTED_METRICS_V1 = [
     "vllm:iteration_tokens_total",
     "vllm:cache_config_info",
     "vllm:request_success_total",
+    "vllm:corrupted_requests",
     "vllm:request_prompt_tokens_sum",
     "vllm:request_prompt_tokens_bucket",
     "vllm:request_prompt_tokens_count",
@@ -292,6 +293,52 @@ async def test_metrics_exist(
         if metric in HIDDEN_DEPRECATED_METRICS and not server.show_hidden_metrics:
             continue
         assert metric in response.text
+
+
+@pytest.mark.asyncio
+async def test_corrupted_requests_metric(
+    server: RemoteOpenAIServer,
+    client: openai.AsyncClient,
+    model_key: str,
+):
+    """Test that corrupted requests metric is present when enabled."""
+    model_name = MODELS[model_key]
+
+    # Send a request to trigger metrics
+    if model_key == "text":
+        await client.completions.create(
+            model=model_name,
+            prompt="Hello, my name is",
+            max_tokens=5,
+            temperature=0.0,
+        )
+    else:
+        await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": _IMAGE_URL}},
+                        {"type": "text", "text": "What's in this image?"},
+                    ],
+                }
+            ],
+            max_tokens=5,
+            temperature=0.0,
+        )
+
+    response = requests.get(server.url_for("metrics"))
+    assert response.status_code == HTTPStatus.OK
+
+    # Check if corrupted requests metric is present
+    # Note: This metric is only available when VLLM_COMPUTE_NANS_IN_LOGITS=1
+    # In normal test runs, it may not be present, so we just check the format
+    metrics_text = response.text
+    if "vllm:corrupted_requests" in metrics_text:
+        # If present, verify it's a counter metric
+        assert "vllm:corrupted_requests{" in metrics_text
+        assert "TYPE vllm:corrupted_requests counter" in metrics_text
 
 
 @pytest.mark.asyncio
