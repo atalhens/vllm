@@ -1042,6 +1042,7 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
             else:

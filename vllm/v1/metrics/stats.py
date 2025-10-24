@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import vllm.envs as envs
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 if TYPE_CHECKING:
@@ -226,6 +227,7 @@ class IterationStats:
         self.inter_token_latencies_iter: list[float] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
+        self.num_corrupted_reqs: int = 0
 
     def __repr__(self) -> str:
         field_to_value_str = ", ".join(f"{k}={v}" for k, v in vars(self).items())
@@ -255,6 +257,9 @@ class IterationStats:
             req_stats.first_token_latency = first_token_latency
 
         req_stats.num_generation_tokens += num_new_generation_tokens
+
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS and output.num_nans_in_logits > 0:
+            self.num_corrupted_reqs += 1
 
         # Process request-level engine core events
         if output.events is not None:
