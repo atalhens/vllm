@@ -21,6 +21,7 @@ from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.policies.factory import cache_policy_config_from_extra
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
@@ -132,6 +133,13 @@ class CPUOffloadingSpec(OffloadingSpec):
         # worker-side
         self._worker: CPUOffloadingWorker | None = None
 
+        # Built-in: "lru", "arc", "prefix_pruning_on_sessions" /
+        # "prefix_pruning". Remote/secondary tiers can keep "lru"
+        # until extra_config grows a per-tier policy.
+        # Session TTL, prefix tiers, and max_tiers match the GPU
+        # vllm-prefix-pruning-on-sessions arm unless extra_config
+        # overrides them (see cache_policy_config_from_extra).
+        # CPU does not copy the GPU idle-TTL demote.
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
@@ -153,6 +161,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 num_chunks=self.num_chunks,
                 cache_policy=self.eviction_policy,
                 cache_policy_module_path=self.cache_policy_module_path,
+                cache_policy_config=cache_policy_config_from_extra(self.extra_config),
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,

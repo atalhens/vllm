@@ -26,7 +26,10 @@ from vllm.v1.kv_offload.cpu.common import (
     CPUOffloadingMetrics,
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
-from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+from vllm.v1.kv_offload.cpu.policies.factory import (
+    CachePolicyFactory,
+    instantiate_cache_policy,
+)
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 
@@ -46,7 +49,8 @@ class _RequestCacheAccess:
 
 class CPUOffloadingManager(OffloadingManager):
     """An OffloadingManager with a pluggable CachePolicy, resolved by name via
-    CachePolicyFactory (built in: "lru", "arc"; external policies can either
+    CachePolicyFactory (built in: "lru", "arc", "prefix_pruning_on_sessions"
+    / "prefix_pruning"; external policies can either
     register their own or be loaded out-of-tree via cache_policy_module_path).
 
     The manager owns all shared logic: ref-counting, event emission,
@@ -60,6 +64,7 @@ class CPUOffloadingManager(OffloadingManager):
         num_chunks: int,
         cache_policy: str = "lru",
         cache_policy_module_path: str | None = None,
+        cache_policy_config: dict | None = None,
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
@@ -72,7 +77,9 @@ class CPUOffloadingManager(OffloadingManager):
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+        self._policy: CachePolicy = instantiate_cache_policy(
+            policy_cls, num_chunks, cache_policy_config
+        )
         # Track the number of chunks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import importlib
-from collections.abc import Callable
+import inspect
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy
@@ -89,3 +91,52 @@ CachePolicyFactory.register_cache_policy(
 CachePolicyFactory.register_cache_policy(
     "arc", "vllm.v1.kv_offload.cpu.policies.arc", "ARCCachePolicy"
 )
+CachePolicyFactory.register_cache_policy(
+    "prefix_pruning_on_sessions",
+    "vllm.v1.kv_offload.cpu.policies.prefix_pruning",
+    "PrefixPruningOnSessionsCachePolicy",
+)
+# Short alias for the same class.
+CachePolicyFactory.register_cache_policy(
+    "prefix_pruning",
+    "vllm.v1.kv_offload.cpu.policies.prefix_pruning",
+    "PrefixPruningOnSessionsCachePolicy",
+)
+
+# Knobs PrefixPruningOnSessionsCachePolicy accepts from extra_config.
+CACHE_POLICY_CONFIG_KEYS = (
+    "first_tier_tokens",
+    "tier_step_tokens",
+    "max_tiers",
+    "session_dead_ttl_s",
+    "session_ewa_alpha",
+    "session_dead_k",
+    "session_min_gaps",
+    "session_detector",
+    "session_quantile",
+    "session_gap_window",
+)
+
+
+def cache_policy_config_from_extra(extra_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Collect policy knobs from extra_config (nested or top-level)."""
+    nested = extra_config.get("eviction_policy_config")
+    merged: dict[str, Any] = dict(nested) if isinstance(nested, dict) else {}
+    for key in CACHE_POLICY_CONFIG_KEYS:
+        if key in extra_config:
+            merged[key] = extra_config[key]
+    return merged
+
+
+def instantiate_cache_policy(
+    policy_cls: type[CachePolicy],
+    cache_capacity: int,
+    policy_config: Mapping[str, Any] | None = None,
+) -> CachePolicy:
+    """Construct a policy, passing only kwargs its ``__init__`` accepts."""
+    sig = inspect.signature(policy_cls.__init__)
+    kwargs: dict[str, Any] = {"cache_capacity": cache_capacity}
+    for name, value in (policy_config or {}).items():
+        if name in sig.parameters:
+            kwargs[name] = value
+    return policy_cls(**kwargs)

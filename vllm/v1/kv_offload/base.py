@@ -90,6 +90,7 @@ TierFilter.ALL = TierFilter(matchers=(TierMatcher(),))
 @dataclass
 class ReqContext:
     req_id: str
+    session_id: str | None = None
     kv_transfer_params: dict[str, Any] | None = None
     kv_hints: KvHintsEnvelope | None = None
     load_tier_filter: TierFilter = TierFilter.ALL

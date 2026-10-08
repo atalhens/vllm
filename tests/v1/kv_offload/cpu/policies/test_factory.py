@@ -10,6 +10,7 @@ from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.prefix_pruning import PrefixPruningCachePolicy
 
 
 class _DummyCachePolicy(CachePolicy):
@@ -62,6 +63,14 @@ class TestCachePolicyFactory:
     def test_lru_and_arc_registered(self):
         assert CachePolicyFactory.get_cache_policy_cls("lru") is LRUCachePolicy
         assert CachePolicyFactory.get_cache_policy_cls("arc") is ARCCachePolicy
+        assert (
+            CachePolicyFactory.get_cache_policy_cls("prefix_pruning")
+            is PrefixPruningCachePolicy
+        )
+        assert (
+            CachePolicyFactory.get_cache_policy_cls("prefix_pruning_on_sessions")
+            is PrefixPruningCachePolicy
+        )
 
     def test_register_and_resolve_custom_policy(self):
         CachePolicyFactory.register_cache_policy(

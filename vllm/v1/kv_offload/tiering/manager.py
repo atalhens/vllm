@@ -98,12 +98,14 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         mmap_region: SharedOffloadRegion,
         cache_policy: str = "lru",
         cache_policy_module_path: str | None = None,
+        cache_policy_config: dict | None = None,
         enable_events: bool = False,
     ):
         super().__init__(
             num_chunks=num_chunks,
             cache_policy=cache_policy,
             cache_policy_module_path=cache_policy_module_path,
+            cache_policy_config=cache_policy_config,
             enable_events=enable_events,
         )
         self._mmap_region = mmap_region

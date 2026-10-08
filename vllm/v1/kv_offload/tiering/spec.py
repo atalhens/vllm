@@ -9,12 +9,23 @@ Configuration via kv_connector_extra_config:
   - cpu_bytes_to_use: (required) Bytes to allocate for CPU primary tier
   - block_size: (optional) Tokens per offloaded chunk (default: GPU block size)
   - eviction_policy: (optional) Primary tier eviction policy: built-in "lru"/
-    "arc", or the name of a policy registered via CachePolicyFactory, or an
+    "arc"/"prefix_pruning_on_sessions" (alias "prefix_pruning"), or the name
+    of a policy registered via CachePolicyFactory, or an
     out-of-tree CachePolicy class name paired with cache_policy_module_path
     (default: "lru")
   - cache_policy_module_path: (optional) Python import path to load
     eviction_policy from when it names an out-of-tree CachePolicy not
     registered via CachePolicyFactory
+  - session_dead_ttl_s / first_tier_tokens / tier_step_tokens /
+    max_tiers / session_ewa_alpha / session_dead_k / session_min_gaps /
+    session_detector / session_quantile / session_gap_window: knobs for
+    prefix_pruning_on_sessions (also accepted under eviction_policy_config).
+    Defaults: 200s / 16384 / 16384 / 8 tiers / 0.3 / 3.0 / 2 /
+    detector "ewa" / quantile 0.95 / gap window 256.
+    Eviction takes a dead session's chunks first, then live prefix tiers,
+    then the LRU tail past max_tiers. session_dead_ttl_s=0 disables the
+    session wipe. max_tiers=0 leaves prefix tiers uncapped. The GPU idle
+    TTL is not applied; CPU capacity is cpu_bytes_to_use.
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "fs",
@@ -69,6 +80,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu.policies.factory import cache_policy_config_from_extra
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.base import TieringOffloadingMetrics
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
@@ -364,6 +376,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     num_chunks=self.num_chunks,
                     cache_policy=self.eviction_policy,
                     cache_policy_module_path=self.cache_policy_module_path,
+                    cache_policy_config=cache_policy_config_from_extra(
+                        self.extra_config
+                    ),
                     enable_events=self.kv_events_config.enable_kv_cache_events,
                     mmap_region=scheduler_mmap,
                 )
