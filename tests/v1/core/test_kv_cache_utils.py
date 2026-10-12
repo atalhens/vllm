@@ -40,6 +40,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     check_enough_kv_cache_memory,
     estimate_max_model_len,
     generate_block_hash_extra_keys,
@@ -988,6 +989,94 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+def test_tiered_free_kv_cache_block_queue_evict_first_tier():
+    """Blocks in the evict-first tier are popped after never-used blocks and
+    before LRU blocks, regardless of the order in which they were freed."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(8)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:2])
+    queue.append_n([blocks[2], blocks[3]])
+    queue.append_n_to_tier([blocks[4], blocks[5]], 0)
+    queue.prepend_n([blocks[6]])
+    queue.append_n_to_tier([blocks[7]], 0)
+    assert queue.num_free_blocks == 8
+    expected = [6, 0, 1, 4, 5, 7, 2, 3]
+    assert [b.block_id for b in queue.get_all_free_blocks()] == expected
+    assert [b.block_id for b in queue.iter_blocks_after(None)] == expected
+
+    # Removing a block next to the tier boundary keeps both tiers linked.
+    queue.remove(blocks[7])
+    queue.remove(blocks[2])
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [6, 0, 1, 4, 5, 3]
+
+    # Popping across the boundary skips it and keeps it usable.
+    assert [b.block_id for b in queue.popleft_n(5)] == [6, 0, 1, 4, 5]
+    assert queue.popleft() is blocks[3]
+    assert queue.num_free_blocks == 0
+    queue.append_n([blocks[0]])
+    queue.append_n_to_tier([blocks[1]], 0)
+    assert [b.block_id for b in queue.popleft_n(2)] == [1, 0]
+    with pytest.raises(ValueError):
+        queue.popleft()
+
+
+def test_tiered_free_kv_cache_block_queue_multiple_tiers():
+    """Tiers are popped in order, each after the never-used blocks and before
+    the LRU tail, and popping across empty tiers keeps them usable."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(10)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=3)
+    queue.append_n([blocks[1]])
+    queue.append_n_to_tier([blocks[2], blocks[3]], 2)
+    queue.append_n_to_tier([blocks[4]], 0)
+    queue.append_n_to_tier([blocks[5]], 1)
+    queue.append_n_to_tier([blocks[6]], 0)
+    expected = [0, 4, 6, 5, 2, 3, 1]
+    assert [b.block_id for b in queue.get_all_free_blocks()] == expected
+    assert [b.block_id for b in queue.iter_blocks_after(None)] == expected
+
+    # Pop through tier 0 and tier 1 into tier 2, then refill the emptied tiers.
+    assert [b.block_id for b in queue.popleft_n(5)] == [0, 4, 6, 5, 2]
+    queue.append_n_to_tier([blocks[7]], 1)
+    queue.append_n_to_tier([blocks[8]], 0)
+    queue.append_n_to_tier([blocks[9]], 2)
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [8, 7, 3, 9, 1]
+
+    queue.remove(blocks[7])
+    assert [b.block_id for b in queue.popleft_n(4)] == [8, 3, 9, 1]
+    assert queue.num_free_blocks == 0
+    with pytest.raises(ValueError):
+        queue.popleft()
+
+
+def test_tiered_free_kv_cache_block_queue_demote_idle():
+    """Idle-TTL demotion moves expired later-tier / LRU blocks into tier 0."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    queue = TieredFreeKVCacheBlockQueue(blocks[:1], num_tiers=2)
+    # never=0, tier0=1, tier1=2,3, LRU=4,5
+    blocks[1].freed_at = 100.0
+    blocks[2].freed_at = 100.0
+    blocks[3].freed_at = 200.0
+    blocks[4].freed_at = 100.0
+    blocks[5].freed_at = 200.0
+    queue.append_n_to_tier([blocks[1]], 0)
+    queue.append_n_to_tier([blocks[2], blocks[3]], 1)
+    queue.append_n([blocks[4], blocks[5]])
+    assert [b.block_id for b in queue.get_all_free_blocks()] == [0, 1, 2, 3, 4, 5]
+
+    # TTL=50 at now=160: expire 1,2,4 (freed_at=100); keep 3,5 (200).
+    n = queue.demote_idle(50.0, now=160.0)
+    assert n == 3
+    # never=0, then demoted into tier0 (1,2,4) after original tier0 empty of
+    # non-expired, then remaining tier1=3, LRU=5. Original tier0 block 1 was
+    # also expired and re-appended to tier0 with the others.
+    got = [b.block_id for b in queue.get_all_free_blocks()]
+    assert got[0] == 0
+    assert set(got[1:4]) == {1, 2, 4}
+    assert got[4:] == [3, 5]
+    # Expired blocks are popped before non-expired later-tier content.
+    assert [b.block_id for b in queue.popleft_n(4)] == got[:4]
+    assert [b.block_id for b in queue.popleft_n(2)] == [3, 5]
 
 
 def test_generate_block_hash_extra_keys():

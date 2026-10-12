@@ -37,6 +37,25 @@ Configuration via kv_connector_extra_config:
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
 
+    The "fs" (storage) tier additionally accepts a byte budget:
+      - capacity_bytes: (optional) Byte budget for the tier. Unset (default)
+        = unbounded. Required for any of the eviction_policy modes below.
+      - eviction_policy: (optional) With capacity_bytes:
+          "lru" (default) — LRU eviction of resident blocks;
+          "prefix_pruning" / "prefix_pruning_on_sessions" — session
+          prefix-pruning eviction (dead session first, then live prefix
+          tiers, then the LRU tail past max_tiers);
+          "reject" / "none" — reject stores that would exceed the budget
+          (no eviction).
+      - session_dead_ttl_s / first_tier_tokens / tier_step_tokens / max_tiers /
+        session_ewa_alpha / session_dead_k / session_min_gaps /
+        session_detector / session_quantile / session_gap_window: prefix-
+        pruning knobs matching the CPU-tier defaults (200s / 16384 / 16384 /
+        8 tiers / 0.3 / 3.0 / 2 / "ewa" / 0.95 / 256). session_dead_ttl_s=0
+        disables the session wipe; max_tiers=0 leaves prefix tiers uncapped.
+        Deletion assumes single-writer/local ownership; blocks with in-flight
+        store/load I/O are never evicted.
+
 Example configuration:
 {
     "cpu_bytes_to_use": 10737418240,  # 10 GB

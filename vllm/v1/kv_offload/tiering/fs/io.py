@@ -187,6 +187,22 @@ def batch_store_block(
             _store_block(path, view, offset, block_size, use_o_direct)
 
 
+def batch_delete_block(paths: list[str]) -> None:
+    """Delete a batch of KV block files, best-effort.
+
+    An already-absent file is not an error (another drain or a short-read
+    cleanup may have removed it). Other errors are logged and swallowed so a
+    single bad path does not abort eviction of the rest.
+    """
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Failed to delete evicted KV block %s: %s", path, exc)
+
+
 def batch_load_block(
     paths: list[str],
     view: memoryview,

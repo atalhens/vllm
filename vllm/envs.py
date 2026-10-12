@@ -236,6 +236,7 @@ if TYPE_CHECKING:
     VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
+    VLLM_KV_CONNECTOR_HIT_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
@@ -328,6 +329,12 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_ENABLE_HPC_OPS: bool = False
+    VLLM_SUFFIX_PRESERVING_EVICTION: bool = False
+    VLLM_SUFFIX_EVICTION_PREFIX_FRACTION: float = 0.5
+    VLLM_SUFFIX_EVICTION_TIER_TOKENS: int = 0
+    VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS: int = 0
+    VLLM_SUFFIX_EVICTION_MAX_TIERS: int = 0
+    VLLM_SUFFIX_EVICTION_IDLE_TTL_S: float = 0.0
 
 
 def get_default_cache_root():
@@ -1755,6 +1762,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
         os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
     ),
+    # Log per-request prefix-cache hits by tier (device/host/disk/p2p) at
+    # schedule time when a KV connector is configured.
+    "VLLM_KV_CONNECTOR_HIT_LOG": lambda: (
+        os.getenv("VLLM_KV_CONNECTOR_HIT_LOG", "False").lower() in ("true", "1")
+    ),
     # Number of parallel KV-load receive threads per worker rank. Lets the
     # per-request control overhead (Python prep + master key lookup) of one
     # request overlap with the RDMA transfer of another, keeping the transfer
@@ -2246,6 +2258,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each op additionally checks its own shape / dtype constraints and falls
     # back to the eager path when they do not hold.
     "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
+    # Evict the leading blocks of a freed request before any other cached
+    # block, and serve prefix-cache hits whose leading blocks were evicted by
+    # recomputing only the missing blocks. Requires prefix caching, a single
+    # full-attention KV cache group, no KV connector and no speculative
+    # decoding.
+    "VLLM_SUFFIX_PRESERVING_EVICTION": lambda: bool(
+        int(os.getenv("VLLM_SUFFIX_PRESERVING_EVICTION", "0"))
+    ),
+    # Fraction of a freed request's blocks, counted from its first block,
+    # that VLLM_SUFFIX_PRESERVING_EVICTION evicts first.
+    "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION": lambda: float(
+        os.getenv("VLLM_SUFFIX_EVICTION_PREFIX_FRACTION", "0.5")
+    ),
+    # When > 0, replaces the prefix fraction: the first this many tokens of
+    # every freed request are evicted before any other cached token, so small
+    # eviction demand falls on one request. Larger demand then grows every
+    # freed request's evicted region in steps of
+    # VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS (default: the same size).
+    "VLLM_SUFFIX_EVICTION_TIER_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_TIER_TOKENS", "0")
+    ),
+    "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS", "0")
+    ),
+    # Cap on the number of position eviction tiers. 0 = uncapped (one tier per
+    # step across max_model_len). When set, blocks past the last tier join the
+    # LRU tail so deep context stays recency-governed.
+    "VLLM_SUFFIX_EVICTION_MAX_TIERS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_MAX_TIERS", "0")
+    ),
+    # Seconds a freed cached block may sit idle before demotion into tier 0.
+    # 0 disables. Reclaims finished / long-idle sessions ahead of fresher
+    # later-tier content.
+    "VLLM_SUFFIX_EVICTION_IDLE_TTL_S": lambda: float(
+        os.getenv("VLLM_SUFFIX_EVICTION_IDLE_TTL_S", "0")
+    ),
     # Whether to skip version suffix when building package
     "VLLM_SKIP_VERSION_SUFFIX": lambda: bool(
         int(os.getenv("VLLM_SKIP_VERSION_SUFFIX", "0"))
@@ -2405,6 +2453,12 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        "VLLM_SUFFIX_PRESERVING_EVICTION",
+        "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION",
+        "VLLM_SUFFIX_EVICTION_TIER_TOKENS",
+        "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS",
+        "VLLM_SUFFIX_EVICTION_MAX_TIERS",
+        "VLLM_SUFFIX_EVICTION_IDLE_TTL_S",
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
     }

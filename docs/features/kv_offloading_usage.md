@@ -162,8 +162,19 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `STORAGE`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
+| `capacity_bytes` | no | unbounded | Byte budget for the tier. Required for `eviction_policy` modes below. Omit for unbounded. See [Storage-Tier Eviction](kv_offload_storage_eviction.md). |
+| `eviction_policy` | no | `lru` | Per-tier storage policy (requires `capacity_bytes`): `lru` evicts least-recently-used blocks; `prefix_pruning` / `prefix_pruning_on_sessions` uses session prefix-pruning; `reject` / `none` rejects writes past the cap. Independent of the top-level (CPU-tier) `eviction_policy`. |
+| `first_tier_tokens`, `tier_step_tokens`, `max_tiers`, `session_dead_ttl_s`, `session_ewa_alpha`, `session_dead_k`, `session_min_gaps`, `session_detector`, `session_quantile`, `session_gap_window` | no | see guide | Prefix-pruning knobs, effective only when eviction is enabled. Full reference in [Storage-Tier Eviction](kv_offload_storage_eviction.md). |
 
 Each thread group prefers its own queue but pulls from the other when its primary queue is empty, so a write-heavy or read-heavy burst won't leave the off-priority queue waiting. Size the totals to your storage's effective concurrency.
+
+By default the FS tier is **unbounded** and never deletes blocks. To bound it:
+
+- `capacity_bytes` + default `eviction_policy: "lru"` — LRU eviction
+- `capacity_bytes` + `eviction_policy: "prefix_pruning"` — session/prefix-aware eviction
+- `capacity_bytes` + `eviction_policy: "reject"` — hard cap, reject writes past the budget (no deletion)
+
+See the dedicated [Storage-Tier Eviction](kv_offload_storage_eviction.md) guide.
 
 #### On-Disk Layout
 

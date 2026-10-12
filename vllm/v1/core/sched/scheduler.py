@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -347,6 +348,12 @@ class Scheduler(SchedulerInterface):
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+
+        # {req_id: (gap_end, suffix_end)} in tokens, for scheduled requests
+        # admitted with a suffix hit that have not computed their gap yet.
+        self._suffix_hits: dict[str, tuple[int, int]] = {}
+        if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
+            self._enable_suffix_preserving_eviction()
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -695,6 +702,10 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if (suffix_hit := self._suffix_hits.get(request.request_id)) is not None:
+                num_new_tokens = min(
+                    num_new_tokens, suffix_hit[0] - request.num_computed_tokens
+                )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
@@ -942,6 +953,8 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
+                suffix_hit = None
+                num_suffix_hit_tokens = 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -952,6 +965,11 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    suffix_hit = self.kv_cache_manager.get_suffix_hit(
+                        new_computed_blocks, num_new_local_computed_tokens
+                    )
+                    if suffix_hit is not None:
+                        num_suffix_hit_tokens = suffix_hit[1] - suffix_hit[0]
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1063,7 +1081,8 @@ class Scheduler(SchedulerInterface):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
+                            num_local_cached_tokens=num_new_local_computed_tokens
+                            + num_suffix_hit_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
                     self._set_kv_fetch_stage(
@@ -1114,6 +1133,8 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if suffix_hit is not None:
+                        num_new_tokens = suffix_hit[0] - num_computed_tokens
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1278,24 +1299,40 @@ class Scheduler(SchedulerInterface):
                         self.kv_cache_manager.get_blocks(request_id),
                         num_external_computed_tokens,
                     )
+                    # The connector knows the tier only after the load
+                    # plan above exists.
+                    preempted = request.num_preemptions > 0
+                    hits_by_source = (
+                        self.connector.get_external_cache_hit_sources(
+                            request, connector_prefix_cache_hits
+                        )
+                        if connector_prefix_cache_hits and not preempted
+                        else None
+                    )
+                    if envs.VLLM_KV_CONNECTOR_HIT_LOG and (
+                        num_new_local_computed_tokens > 0
+                        or connector_prefix_cache_hits > 0
+                    ):
+                        logger.info(
+                            "Prefix cache hits: req_id=%s device=%d "
+                            "external=%d by_source=%s",
+                            request_id,
+                            num_new_local_computed_tokens,
+                            connector_prefix_cache_hits,
+                            {
+                                source.value: count
+                                for source, count in (hits_by_source or {}).items()
+                            },
+                        )
                     if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
                     ):
-                        preempted = request.num_preemptions > 0
                         self.connector_prefix_cache_stats.record(
                             num_tokens=connector_prefix_cache_queries,
                             num_hits=connector_prefix_cache_hits,
                             preempted=preempted,
-                            # The connector knows the tier only after the load
-                            # plan above exists.
-                            hits_by_source=(
-                                self.connector.get_external_cache_hit_sources(
-                                    request, connector_prefix_cache_hits
-                                )
-                                if connector_prefix_cache_hits and not preempted
-                                else None
-                            ),
+                            hits_by_source=hits_by_source,
                         )
 
                 # Record at admission so unscheduled lookups are not counted.
@@ -1354,6 +1391,17 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if suffix_hit is not None:
+                    self._suffix_hits[request_id] = suffix_hit
+                    logger.debug(
+                        "Request %s: suffix hit, computing tokens [%d, %d) "
+                        "then skipping cached tokens [%d, %d).",
+                        request_id,
+                        num_computed_tokens,
+                        suffix_hit[0],
+                        suffix_hit[0],
+                        suffix_hit[1],
+                    )
                 self._set_kv_fetch_stage(request, None)
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
@@ -1558,6 +1606,59 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
+    def _enable_suffix_preserving_eviction(self) -> None:
+        unsupported = []
+        if self.connector is not None:
+            unsupported.append("KV connectors")
+        if self.vllm_config.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        if self.parallel_config.pipeline_parallel_size > 1:
+            unsupported.append("pipeline parallelism")
+        if self.dcp_world_size > 1 or self.pcp_world_size > 1:
+            unsupported.append("context parallelism")
+        if self.is_encoder_decoder:
+            unsupported.append("encoder-decoder models")
+        if unsupported:
+            raise ValueError(
+                "VLLM_SUFFIX_PRESERVING_EVICTION does not support "
+                + ", ".join(unsupported)
+            )
+        fraction = envs.VLLM_SUFFIX_EVICTION_PREFIX_FRACTION
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError(
+                "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION must be in [0, 1], "
+                f"got {fraction}"
+            )
+        tier_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_TOKENS
+        step_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS
+        max_tiers = envs.VLLM_SUFFIX_EVICTION_MAX_TIERS
+        idle_ttl_s = envs.VLLM_SUFFIX_EVICTION_IDLE_TTL_S
+        if tier_tokens < 0 or step_tokens < 0:
+            raise ValueError("Suffix eviction tier sizes must not be negative")
+        if max_tiers < 0:
+            raise ValueError("VLLM_SUFFIX_EVICTION_MAX_TIERS must not be negative")
+        if idle_ttl_s < 0:
+            raise ValueError("VLLM_SUFFIX_EVICTION_IDLE_TTL_S must not be negative")
+        self.kv_cache_manager.enable_suffix_preserving_eviction(
+            fraction, tier_tokens, step_tokens, max_tiers, idle_ttl_s
+        )
+        if tier_tokens:
+            logger.info(
+                "Suffix-preserving eviction enabled with eviction tiers of %d "
+                "tokens, then steps of %d tokens (max_tiers=%s, idle_ttl_s=%s).",
+                tier_tokens,
+                step_tokens or tier_tokens,
+                max_tiers or "uncapped",
+                idle_ttl_s or "off",
+            )
+        else:
+            logger.info(
+                "Suffix-preserving eviction enabled with prefix fraction %.2f "
+                "(idle_ttl_s=%s).",
+                fraction,
+                idle_ttl_s or "off",
+            )
+
     def _get_new_block_ids_to_zero(self) -> list[int] | None:
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
@@ -1625,6 +1726,11 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            suffix_hit = self._suffix_hits.get(req_id)
+            if suffix_hit is not None and request.num_computed_tokens >= suffix_hit[0]:
+                # The gap is scheduled; skip over the cached suffix.
+                del self._suffix_hits[req_id]
+                request.num_computed_tokens = suffix_hit[1]
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -2764,6 +2870,7 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        self._suffix_hits.pop(request.request_id, None)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return

@@ -11,11 +11,12 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
+    UnitaryKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -223,6 +224,90 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # Set by `enable_suffix_preserving_eviction`.
+        self._suffix_hit_manager: FullAttentionManager | None = None
+
+    def enable_suffix_preserving_eviction(
+        self,
+        prefix_evict_fraction: float,
+        first_tier_tokens: int = 0,
+        tier_tokens: int = 0,
+        max_tiers: int = 0,
+        idle_ttl_s: float = 0.0,
+    ) -> None:
+        """Evict the leading blocks of freed requests first, and let
+        `get_computed_blocks` return hits whose leading blocks were evicted.
+
+        Args:
+            prefix_evict_fraction: Fraction of a freed request's blocks,
+                counted from its first block, that are evicted first. Used
+                when `first_tier_tokens` is 0.
+            first_tier_tokens: Leading tokens of every freed request that are
+                evicted before any other cached token.
+            tier_tokens: Size of each following eviction tier, so that the
+                evicted region grows across requests in steps of this many
+                tokens. Defaults to `first_tier_tokens`.
+            max_tiers: When > 0, cap the number of position tiers. Blocks past
+                the last tier join the LRU tail, so recency still governs the
+                deep body of each request.
+            idle_ttl_s: When > 0, free blocks idle at least this many seconds
+                are demoted into tier 0 before the next allocation, so finished
+                or long-idle sessions are reclaimed ahead of fresher later-tier
+                content.
+        """
+        manager = self.coordinator.single_type_managers[0]
+        if (
+            not self.enable_caching
+            or not isinstance(self.coordinator, UnitaryKVCacheCoordinator)
+            or type(manager) is not FullAttentionManager
+        ):
+            raise ValueError(
+                "Suffix-preserving eviction requires prefix caching and a "
+                "single full-attention KV cache group."
+            )
+        block_size = manager.block_size
+        first_tier_len = first_tier_tokens // block_size
+        tier_len = (tier_tokens or first_tier_tokens) // block_size
+        if first_tier_tokens and (first_tier_len == 0 or tier_len == 0):
+            raise ValueError(
+                f"Suffix eviction tier sizes must be at least one block "
+                f"({block_size} tokens)."
+            )
+        if max_tiers < 0:
+            raise ValueError(f"max_tiers must be >= 0, got {max_tiers}")
+        if idle_ttl_s < 0:
+            raise ValueError(f"idle_ttl_s must be >= 0, got {idle_ttl_s}")
+        num_tiers = 1
+        if first_tier_len:
+            max_num_blocks = cdiv(self.max_model_len, block_size)
+            full_tiers = 1 + max(0, cdiv(max_num_blocks - first_tier_len, tier_len))
+            num_tiers = min(full_tiers, max_tiers) if max_tiers > 0 else full_tiers
+        self.block_pool.enable_prefix_first_eviction(num_tiers, idle_ttl_s)
+        manager.enable_suffix_preserving_eviction(
+            prefix_evict_fraction, first_tier_len, tier_len if first_tier_len else 0
+        )
+        self._suffix_hit_manager = manager
+
+    def get_suffix_hit(
+        self, computed_blocks: KVCacheBlocks, num_prefix_hit_tokens: int
+    ) -> tuple[int, int] | None:
+        """Get the gap end and suffix end, in tokens, of a suffix hit returned by
+        `get_computed_blocks`, or None if the hit has no suffix.
+
+        Tokens in [num_prefix_hit_tokens, gap_end) must be computed before
+        the request can skip to suffix_end.
+        """
+        if self._suffix_hit_manager is None:
+            return None
+        blocks = computed_blocks.blocks[0]
+        block_size = self._suffix_hit_manager.block_size
+        gap_end = num_prefix_hit_tokens // block_size
+        if len(blocks) <= gap_end:
+            return None
+        while blocks[gap_end].is_null:
+            gap_end += 1
+        return gap_end * block_size, len(blocks) * block_size
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -316,6 +401,21 @@ class KVCacheManager:
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
+
+        # Multimodal requests are excluded because encoder inputs are scheduled
+        # from a contiguous computed prefix.
+        if self._suffix_hit_manager is not None and not request.mm_features:
+            prefix_hit_blocks = computed_blocks[0]
+            suffix_hit = self._suffix_hit_manager.find_suffix_hit(
+                request.block_hashes, len(prefix_hit_blocks), max_cache_hit_length
+            )
+            if suffix_hit is not None:
+                suffix_start, suffix_blocks = suffix_hit
+                prefix_hit_blocks.extend(
+                    [self.block_pool.null_block]
+                    * (suffix_start - len(prefix_hit_blocks))
+                )
+                prefix_hit_blocks.extend(suffix_blocks)
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary

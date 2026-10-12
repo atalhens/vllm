@@ -223,6 +223,29 @@ class AsyncLookupManager(ABC):
                 state.result = False
                 state.phase = LookupPhase.RESOLVED
 
+    def invalidate(self, keys: Collection[OffloadKey]) -> None:
+        """Drop cached verdicts for ``keys`` so the next lookup re-probes.
+
+        Used by the tier after it evicts (deletes) a block: unlike
+        ``mark_miss`` (which pins a False verdict), a re-stored key must be
+        able to resolve to HIT again. Dropping the ``LookupState`` makes the
+        next ``lookup()`` create a fresh entry and re-queue a disk probe.
+
+        Only entries with no outstanding request references and no in-flight
+        probe are dropped, which keeps the ``_req_keys`` reverse index and the
+        ``cleanup`` path consistent. A rare stale HIT left behind for a key
+        still being looked up self-heals: its promotion load fails on the
+        missing file and ``mark_miss`` pins the verdict (see get_finished_jobs).
+        """
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if (
+                state is not None
+                and not state.request_ids
+                and state.phase is not LookupPhase.IN_FLIGHT
+            ):
+                del self._lookup_state[key]
+
     def cleanup(self, req_id: str) -> None:
         """Release request references, retaining in-flight lookups.
 
