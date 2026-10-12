@@ -476,6 +476,22 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 # Other connectors still receive the request's real blocks
                 c.update_state_after_alloc(request, blocks, 0)
 
+    def get_offload_suffix_hit(self, request: "Request") -> tuple[int, int] | None:
+        chosen = self._requests_to_connector.get(request.request_id)
+        if chosen is None:
+            return None
+        connector = self._connectors[chosen]
+        getter = getattr(connector, "get_offload_suffix_hit", None)
+        return getter(request) if getter is not None else None
+
+    def take_offload_suffix_hit(self, request: "Request") -> tuple[int, int] | None:
+        chosen = self._requests_to_connector.get(request.request_id)
+        if chosen is None:
+            return None
+        connector = self._connectors[chosen]
+        taker = getattr(connector, "take_offload_suffix_hit", None)
+        return taker(request) if taker is not None else None
+
     def on_new_request(self, request: "Request") -> None:
         for c in self._connectors:
             c.on_new_request(request)

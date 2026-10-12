@@ -352,6 +352,9 @@ class Scheduler(SchedulerInterface):
         # {req_id: (gap_end, suffix_end)} in tokens, for scheduled requests
         # admitted with a suffix hit that have not computed their gap yet.
         self._suffix_hits: dict[str, tuple[int, int]] = {}
+        # Requests whose offload suffix has been loaded into already-allocated
+        # blocks; the next WAITING schedule recomputes the gap then jumps.
+        self._offload_suffix_ready: set[str] = set()
         if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
             self._enable_suffix_preserving_eviction()
 
@@ -955,24 +958,47 @@ class Scheduler(SchedulerInterface):
                 did_prefix_cache_lookup = False
                 suffix_hit = None
                 num_suffix_hit_tokens = 0
+                offload_suffix_resume = False
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    did_prefix_cache_lookup = True
-                    (
-                        new_computed_blocks,
-                        num_new_local_computed_tokens,
-                        request.shared_prefix_boundary,
-                        hit_diverged,
-                    ) = self._get_local_prefix_cache_hit(request)
-                    suffix_hit = self.kv_cache_manager.get_suffix_hit(
-                        new_computed_blocks, num_new_local_computed_tokens
-                    )
-                    if suffix_hit is not None:
+                    # Offload suffix resume: blocks already hold a loaded
+                    # suffix (e.g. CDE); recompute the peeled gap (AB) then
+                    # jump. Skip a second prefix/connector lookup. Stay in
+                    # `_offload_suffix_ready` until allocate succeeds so a
+                    # watermark reject can retry this path.
+                    offload_suffix_resume = request_id in self._offload_suffix_ready
+                    if offload_suffix_resume:
+                        suffix_hit = self._suffix_hits.get(request_id)
+                        assert suffix_hit is not None
                         num_suffix_hit_tokens = suffix_hit[1] - suffix_hit[0]
+                        new_computed_blocks = (
+                            self.kv_cache_manager.empty_kv_cache_blocks
+                        )
+                        num_new_local_computed_tokens = 0
+                        num_external_computed_tokens = 0
+                        num_computed_tokens = 0
+                        load_kv_async = False
+                        did_prefix_cache_lookup = False
+                    else:
+                        did_prefix_cache_lookup = True
+                        (
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            request.shared_prefix_boundary,
+                            hit_diverged,
+                        ) = self._get_local_prefix_cache_hit(request)
+                        suffix_hit = self.kv_cache_manager.get_suffix_hit(
+                            new_computed_blocks, num_new_local_computed_tokens
+                        )
+                        if suffix_hit is not None:
+                            num_suffix_hit_tokens = suffix_hit[1] - suffix_hit[0]
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    if (
+                        did_prefix_cache_lookup
+                        and self.connector is not None
+                    ):
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
                         # sub-block tail without racing its copy-on-write.
@@ -1046,30 +1072,32 @@ class Scheduler(SchedulerInterface):
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
 
-                    # Total computed tokens (local + external).
-                    num_computed_tokens = (
-                        num_new_local_computed_tokens + num_external_computed_tokens
-                    )
-                    assert num_computed_tokens <= request.num_tokens
-                    # DSV41 SWA bounded replay: a KV load that carries the
-                    # window is taken as is; any other hit no longer than the
-                    # replayed window would be recomputed in full and save
-                    # nothing.
-                    window_loaded = bool(
-                        num_external_computed_tokens
-                    ) and self._load_restores_replay_window(request)
-                    if (
-                        not window_loaded
-                        and 0 < num_computed_tokens <= self.prefix_replay_tokens
-                    ):
-                        new_computed_blocks = (
-                            self.kv_cache_manager.empty_kv_cache_blocks
+                    if did_prefix_cache_lookup:
+                        # Total computed tokens (local + external).
+                        num_computed_tokens = (
+                            num_new_local_computed_tokens
+                            + num_external_computed_tokens
                         )
-                        num_new_local_computed_tokens = 0
-                        num_external_computed_tokens = 0
-                        connector_prefix_cache_hits = 0
-                        num_computed_tokens = 0
-                        load_kv_async = False
+                        assert num_computed_tokens <= request.num_tokens
+                        # DSV41 SWA bounded replay: a KV load that carries the
+                        # window is taken as is; any other hit no longer than the
+                        # replayed window would be recomputed in full and save
+                        # nothing.
+                        window_loaded = bool(
+                            num_external_computed_tokens
+                        ) and self._load_restores_replay_window(request)
+                        if (
+                            not window_loaded
+                            and 0 < num_computed_tokens <= self.prefix_replay_tokens
+                        ):
+                            new_computed_blocks = (
+                                self.kv_cache_manager.empty_kv_cache_blocks
+                            )
+                            num_new_local_computed_tokens = 0
+                            num_external_computed_tokens = 0
+                            connector_prefix_cache_hits = 0
+                            num_computed_tokens = 0
+                            load_kv_async = False
 
                     # Skip request with pending mm encoding prefetches
                     if self._ec_transfer_pending(request, num_computed_tokens):
@@ -1083,7 +1111,11 @@ class Scheduler(SchedulerInterface):
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens
                             + num_suffix_hit_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
+                            num_external_cached_tokens=(
+                                num_external_computed_tokens
+                                if did_prefix_cache_lookup
+                                else num_suffix_hit_tokens
+                            ),
                         )
                     self._set_kv_fetch_stage(
                         request, KV_FETCH_WAITING_TO_START if load_kv_async else None
@@ -1289,6 +1321,9 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
+                if offload_suffix_resume:
+                    self._offload_suffix_ready.discard(request_id)
+
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
@@ -1299,6 +1334,16 @@ class Scheduler(SchedulerInterface):
                         self.kv_cache_manager.get_blocks(request_id),
                         num_external_computed_tokens,
                     )
+                    # Suffix hits allocate through suffix_end (incl. gap) but
+                    # only the loaded suffix counts as an external cache hit.
+                    peek_suffix = getattr(
+                        self.connector, "get_offload_suffix_hit", None
+                    )
+                    if peek_suffix is not None and connector_prefix_cache_hits:
+                        offload_suffix = peek_suffix(request)
+                        if offload_suffix is not None:
+                            gap_end, suffix_end = offload_suffix
+                            connector_prefix_cache_hits = suffix_end - gap_end
                     # The connector knows the tier only after the load
                     # plan above exists.
                     preempted = request.num_preemptions > 0
@@ -2871,6 +2916,7 @@ class Scheduler(SchedulerInterface):
         pool when an in-flight GPU step may still write them.
         """
         self._suffix_hits.pop(request.request_id, None)
+        self._offload_suffix_ready.discard(request.request_id)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return
@@ -3244,6 +3290,12 @@ class Scheduler(SchedulerInterface):
         assert self.connector is not None
 
         load_failed = request.request_id in self.failed_recving_kv_req_ids
+        take_suffix = getattr(self.connector, "take_offload_suffix_hit", None)
+        # Always consume a pending suffix hit so it cannot leak across retries.
+        offload_suffix = take_suffix(request) if take_suffix is not None else None
+        if load_failed:
+            offload_suffix = None
+
         if load_failed:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
@@ -3265,25 +3317,45 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.free(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
+            self._suffix_hits.pop(request.request_id, None)
+            self._offload_suffix_ready.discard(request.request_id)
+        elif offload_suffix is not None:
+            # Prefix-pruned offload: suffix (e.g. CDE) is loaded; gap (AB)
+            # must be recomputed before jumping past the suffix.
+            gap_end, suffix_end = offload_suffix
+            self.kv_cache_manager.register_offload_suffix_hit(
+                request, gap_end, suffix_end
+            )
+            request.num_computed_tokens = 0
+            self._suffix_hits[request.request_id] = offload_suffix
+            self._offload_suffix_ready.add(request.request_id)
+            logger.debug(
+                "Request %s: offload suffix loaded [%d, %d); "
+                "will recompute gap then jump",
+                request.request_id,
+                gap_end,
+                suffix_end,
+            )
         else:
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
-        # DSV41 SWA bounded replay recomputes the tail of a hit loaded without
-        # its window, or of a failed load, which may have lost it; the replay
-        # covers the last token. Otherwise a full prompt hit re-computes that
-        # token so the next one can be sampled.
-        num_replay_tokens = self._mark_prefix_replay(
-            request,
-            request.num_computed_tokens,
-            window_loaded=not load_failed
-            and self._load_restores_replay_window(request),
-        )
-        if num_replay_tokens > 0:
-            request.num_computed_tokens -= num_replay_tokens
-        elif request.num_computed_tokens == request.num_tokens:
-            request.num_computed_tokens = request.num_tokens - 1
+        if offload_suffix is None:
+            # DSV41 SWA bounded replay recomputes the tail of a hit loaded
+            # without its window, or of a failed load, which may have lost
+            # it; the replay covers the last token. Otherwise a full prompt
+            # hit re-computes that token so the next one can be sampled.
+            num_replay_tokens = self._mark_prefix_replay(
+                request,
+                request.num_computed_tokens,
+                window_loaded=not load_failed
+                and self._load_restores_replay_window(request),
+            )
+            if num_replay_tokens > 0:
+                request.num_computed_tokens -= num_replay_tokens
+            elif request.num_computed_tokens == request.num_tokens:
+                request.num_computed_tokens = request.num_tokens - 1
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
     def _handle_blocked_waiting_request(self, request: Request) -> bool:

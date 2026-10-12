@@ -2035,6 +2035,141 @@ class TestMaximalPrefixLookup:
         sched._events_tracker.record_lookup.assert_not_called()
 
 
+class TestOffloadSuffixHit:
+    """Prefix-pruning leaves a hole (AB miss, CDE hit): load CDE, recompute AB."""
+
+    def test_find_suffix_hit_after_prefix_miss(self):
+        keys = to_keys([1, 2, 3, 4, 5])
+        sched = _make_scheduler_with_lookup(
+            {3: LookupResult.HIT, 4: LookupResult.HIT, 5: LookupResult.HIT}
+        )
+        assert (
+            sched._find_suffix_hit(
+                keys,
+                _EMPTY_REQ_CTX,
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                start_chunk_idx=0,
+                num_prefix_hit_chunks=0,
+            )
+            == (2, 3)
+        )
+
+    def test_find_suffix_hit_none_when_all_miss(self):
+        sched = _make_scheduler_with_lookup({})
+        assert (
+            sched._find_suffix_hit(
+                to_keys([1, 2, 3]),
+                _EMPTY_REQ_CTX,
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                start_chunk_idx=0,
+                num_prefix_hit_chunks=0,
+            )
+            == (0, 0)
+        )
+
+    def test_find_suffix_hit_defers_on_retry(self):
+        sched = _make_scheduler_with_lookup(
+            {3: LookupResult.RETRY, 4: LookupResult.HIT}
+        )
+        assert (
+            sched._find_suffix_hit(
+                to_keys([1, 2, 3, 4]),
+                _EMPTY_REQ_CTX,
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                start_chunk_idx=0,
+                num_prefix_hit_chunks=0,
+            )
+            is None
+        )
+
+    def test_lookup_returns_span_through_suffix(self, request_runner):
+        """ABCDE needed, only CDE cached → hit tokens cover through E."""
+        block_size = 4
+        runner = request_runner(
+            block_size=block_size,
+            num_gpu_blocks=100,
+            async_scheduling=False,
+        )
+        # Chunk hashes 1..5 for blocks A..E; only 3,4,5 (CDE) are cached.
+        runner.manager.lookup.side_effect = lambda key, req_context: (
+            LookupResult.HIT
+            if int(get_offload_block_hash(key).decode()) in {3, 4, 5}
+            else LookupResult.MISS
+        )
+        sched = runner.connector_scheduler
+        req_status = TestEagle._make_req_status(
+            sched,
+            num_tokens=20,
+            offload_keys_per_group=[[1, 2, 3, 4, 5]],
+        )
+        assert sched._lookup(req_status) == 20
+        assert req_status.suffix_gap_end == 8
+        assert req_status.suffix_end == 20
+
+    def test_update_state_after_alloc_loads_only_suffix(self, request_runner):
+        block_size = 4
+        runner = request_runner(
+            block_size=block_size,
+            num_gpu_blocks=100,
+            async_scheduling=False,
+        )
+        runner.manager.lookup.side_effect = lambda key, req_context: (
+            LookupResult.HIT
+            if int(get_offload_block_hash(key).decode()) in {3, 4, 5}
+            else LookupResult.MISS
+        )
+        sched = runner.connector_scheduler
+        request = MagicMock()
+        request.request_id = "suffix-req"
+        request.kv_transfer_params = None
+        request.num_tokens = request.num_prompt_tokens = 20
+        request.block_hashes = [BlockHash(str(i).encode()) for i in range(5)]
+        request.skip_reading_prefix_cache = False
+        request.all_token_ids = list(range(20))
+        request.lora_request = None
+        sched.on_new_request(request)
+        req_status = sched._req_status[request.request_id]
+        req_status.group_states[0].offload_keys = TestEagle._group_keys(
+            0, [1, 2, 3, 4, 5]
+        )
+
+        external, load_async = sched.get_num_new_matched_tokens(request, 0)
+        assert external == 20 and load_async
+        assert sched.peek_suffix_hit(request.request_id) == (8, 20)
+
+        pool = BlockPool(100, enable_caching=True, hash_block_size=block_size)
+        manager = FullAttentionManager(
+            kv_cache_spec=sched.config.kv_group_configs[0].kv_cache_spec,
+            block_pool=pool,
+            enable_caching=True,
+            kv_cache_group_id=0,
+            scheduler_block_size=block_size,
+        )
+        manager.add_local_computed_blocks(request.request_id, [], 0, external)
+        manager.allocate_external_computed_blocks(request.request_id, 0, external)
+        blocks = KVCacheBlocks((manager.req_to_blocks[request.request_id],))
+        sched.update_state_after_alloc(request, blocks, external)
+
+        assert len(sched._jobs) == 1
+        job = next(iter(sched._jobs.values()))
+        loaded_hashes = {
+            int(get_offload_block_hash(k).decode()) for k in job.keys
+        }
+        assert loaded_hashes == {3, 4, 5}
+        assert req_status.load_key_ranges == [
+            (8, 12, req_status.group_states[0].offload_keys[2]),
+            (12, 16, req_status.group_states[0].offload_keys[3]),
+            (16, 20, req_status.group_states[0].offload_keys[4]),
+        ]
+        # Gap must remain storeable after recompute.
+        assert req_status.group_states[0].next_stored_chunk_idx == 0
+        assert sched.take_suffix_hit(request.request_id) == (8, 20)
+        assert sched.peek_suffix_hit(request.request_id) is None
+
+
 class TestSlidingWindowLookup:
     def test_pending_chunk_behind_gap_does_not_defer(self):
         """A pending suffix too short for the window cannot improve the hit."""

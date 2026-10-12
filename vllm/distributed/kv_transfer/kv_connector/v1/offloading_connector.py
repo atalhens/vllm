@@ -198,6 +198,16 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             request, blocks, num_external_tokens
         )
 
+    def get_offload_suffix_hit(self, request: "Request") -> tuple[int, int] | None:
+        """``(gap_end, suffix_end)`` if lookup found a peeled offload suffix."""
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.peek_suffix_hit(request.request_id)
+
+    def take_offload_suffix_hit(self, request: "Request") -> tuple[int, int] | None:
+        """Consume a pending offload suffix hit after the async load finishes."""
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.take_suffix_hit(request.request_id)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
