@@ -658,7 +658,7 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            if request.request_id in self._suffix_hits or request.num_computed_tokens >= request.num_prompt_tokens - 1:
+            if request.request_id in self._suffix_hits:
                 logger.info(
                     "Running suffix state: req_id=%s status=%s computed=%d "
                     "prompt=%d num_tokens=%d in_flight=%d suffix=%s "
@@ -1829,13 +1829,18 @@ class Scheduler(SchedulerInterface):
                     request.num_tokens,
                     request.num_output_placeholders,
                 )
-                # The gap is scheduled; skip over the cached suffix. The
-                # terminal prompt token is already represented by the loaded
-                # suffix, so do not rewind the request below the prompt
-                # boundary. Rewinding here leaves the request marked as a
-                # prefill forever and prevents the decode step from running.
+                # The gap is scheduled; skip over the cached suffix. Keep
+                # the final prompt token pending so its logits can produce the
+                # first generated token. If we advance to prompt length here,
+                # the next scheduling pass computes zero new tokens forever.
                 del self._suffix_hits[req_id]
-                request.num_computed_tokens = suffix_hit[1]
+                suffix_end = suffix_hit[1]
+                if (
+                    suffix_end == request.num_tokens
+                    and self.num_sampled_tokens_per_step > 0
+                ):
+                    suffix_end -= self.num_sampled_tokens_per_step
+                request.num_computed_tokens = suffix_end
                 logger.info(
                     "Offload suffix jump result: req_id=%s computed=%d "
                     "is_prefill=%s",
