@@ -461,12 +461,24 @@ class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
         block_ids: list[int],
         group_sizes: Sequence[int],
         block_indices: Sequence[int],
+        segments: Sequence[Sequence[tuple[int, int]]] | None = None,
     ):
         super().__init__(block_ids)
         assert sum(group_sizes) == len(block_ids)
         assert len(block_indices) == len(group_sizes)
         self.group_sizes: Sequence[int] = group_sizes
         self.block_indices: Sequence[int] = block_indices
+        # Each group is a list of (first GPU block index, block count).
+        # Several segments load every cached run when holes split the request.
+        # The default is one segment covering that group's block_indices entry.
+        if segments is None:
+            segments = [
+                [(idx, size)] for idx, size in zip(block_indices, group_sizes)
+            ]
+        assert len(segments) == len(group_sizes)
+        for size, group_segments in zip(group_sizes, segments):
+            assert sum(count for _, count in group_segments) == size
+        self.segments: Sequence[Sequence[tuple[int, int]]] = segments
 
 
 @dataclass

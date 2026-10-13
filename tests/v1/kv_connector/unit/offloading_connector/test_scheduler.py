@@ -2038,103 +2038,66 @@ class TestMaximalPrefixLookup:
 class TestOffloadSuffixHit:
     """Prefix-pruning leaves a hole (AB miss, CDE hit): load CDE, recompute AB."""
 
-    def test_find_suffix_hit_after_prefix_miss(self):
+    def test_find_hit_runs_after_prefix_miss(self):
         keys = to_keys([1, 2, 3, 4, 5])
         sched = _make_scheduler_with_lookup(
             {3: LookupResult.HIT, 4: LookupResult.HIT, 5: LookupResult.HIT}
         )
         assert (
-            sched._find_suffix_hit(
-                keys,
-                _EMPTY_REQ_CTX,
-                _LOOKUP_REQ,
-                _LOOKUP_GROUP_CONFIG,
-                start_chunk_idx=0,
-                num_prefix_hit_chunks=0,
+            sched._find_hit_runs(
+                keys, _EMPTY_REQ_CTX, _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0
             )
-            == (2, 3)
+            == [(2, 3)]
         )
 
-    def test_find_suffix_hit_none_when_all_miss(self):
+    def test_find_hit_runs_none_when_all_miss(self):
         sched = _make_scheduler_with_lookup({})
         assert (
-            sched._find_suffix_hit(
+            sched._find_hit_runs(
                 to_keys([1, 2, 3]),
                 _EMPTY_REQ_CTX,
                 _LOOKUP_REQ,
                 _LOOKUP_GROUP_CONFIG,
-                start_chunk_idx=0,
-                num_prefix_hit_chunks=0,
+                0,
             )
-            == (0, 0)
+            == []
         )
 
-    def test_find_suffix_hit_keeps_first_run_when_a_later_block_misses(self):
-        # Same as GPU find_suffix_hit: the first cached run is reusable.
-        # A later miss ends it; tokens after the run are computed after the jump.
+    def test_find_hit_runs_keeps_every_cached_run(self):
         keys = to_keys([1, 2, 3, 4, 5, 6, 7, 8])
         sched = _make_scheduler_with_lookup(
             {3: LookupResult.HIT, 5: LookupResult.HIT, 6: LookupResult.HIT}
         )
         assert (
-            sched._find_suffix_hit(
-                keys,
-                _EMPTY_REQ_CTX,
-                _LOOKUP_REQ,
-                _LOOKUP_GROUP_CONFIG,
-                start_chunk_idx=0,
-                num_prefix_hit_chunks=0,
+            sched._find_hit_runs(
+                keys, _EMPTY_REQ_CTX, _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0
             )
-            == (2, 1)
+            == [(2, 1), (4, 2)]
         )
 
-    def test_find_suffix_hit_stops_at_hole_inside_suffix(self):
-        keys = to_keys([1, 2, 3, 4, 5, 6])
-        sched = _make_scheduler_with_lookup(
-            {3: LookupResult.HIT, 5: LookupResult.HIT, 6: LookupResult.HIT}
-        )
-        assert (
-            sched._find_suffix_hit(
-                keys,
-                _EMPTY_REQ_CTX,
-                _LOOKUP_REQ,
-                _LOOKUP_GROUP_CONFIG,
-                start_chunk_idx=0,
-                num_prefix_hit_chunks=0,
-            )
-            == (2, 1)
-        )
-
-    def test_find_suffix_hit_after_partial_prefix(self):
-        # Block 1 is present, 2 is the miss that ends the prefix, 4-5 remain.
+    def test_find_hit_runs_keeps_prefix_and_later_run(self):
         keys = to_keys([1, 2, 3, 4, 5])
         sched = _make_scheduler_with_lookup(
             {1: LookupResult.HIT, 4: LookupResult.HIT, 5: LookupResult.HIT}
         )
         assert (
-            sched._find_suffix_hit(
-                keys,
-                _EMPTY_REQ_CTX,
-                _LOOKUP_REQ,
-                _LOOKUP_GROUP_CONFIG,
-                start_chunk_idx=0,
-                num_prefix_hit_chunks=1,
+            sched._find_hit_runs(
+                keys, _EMPTY_REQ_CTX, _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0
             )
-            == (3, 2)
+            == [(0, 1), (3, 2)]
         )
 
-    def test_find_suffix_hit_defers_on_retry(self):
+    def test_find_hit_runs_defers_on_retry(self):
         sched = _make_scheduler_with_lookup(
             {3: LookupResult.RETRY, 4: LookupResult.HIT}
         )
         assert (
-            sched._find_suffix_hit(
+            sched._find_hit_runs(
                 to_keys([1, 2, 3, 4]),
                 _EMPTY_REQ_CTX,
                 _LOOKUP_REQ,
                 _LOOKUP_GROUP_CONFIG,
-                start_chunk_idx=0,
-                num_prefix_hit_chunks=0,
+                0,
             )
             is None
         )
@@ -2160,8 +2123,7 @@ class TestOffloadSuffixHit:
             offload_keys_per_group=[[1, 2, 3, 4, 5]],
         )
         assert sched._lookup(req_status) == 20
-        assert req_status.suffix_gap_end == 8
-        assert req_status.suffix_end == 20
+        assert req_status.hit_spans == [(8, 20)]
 
     def test_lookup_keeps_suffix_when_tail_block_misses(self, request_runner):
         """A later miss must not discard the cached run in front of it."""
@@ -2183,8 +2145,7 @@ class TestOffloadSuffixHit:
             offload_keys_per_group=[[1, 2, 3, 4, 5, 6, 7, 8]],
         )
         assert sched._lookup(req_status) == 16
-        assert req_status.suffix_gap_end == 8
-        assert req_status.suffix_end == 16
+        assert req_status.hit_spans == [(8, 16)]
 
     def test_update_state_after_alloc_loads_only_suffix(self, request_runner):
         block_size = 4
@@ -2215,7 +2176,7 @@ class TestOffloadSuffixHit:
 
         external, load_async = sched.get_num_new_matched_tokens(request, 0)
         assert external == 20 and load_async
-        assert sched.peek_suffix_hit(request.request_id) == (8, 20)
+        assert sched.peek_suffix_hit(request.request_id) == [(8, 20)]
 
         pool = BlockPool(100, enable_caching=True, hash_block_size=block_size)
         manager = FullAttentionManager(
@@ -2247,7 +2208,7 @@ class TestOffloadSuffixHit:
         ]
         # Gap must remain storeable after recompute.
         assert req_status.group_states[0].next_stored_chunk_idx == 0
-        assert sched.take_suffix_hit(request.request_id) == (8, 20)
+        assert sched.take_suffix_hit(request.request_id) == [(8, 20)]
         assert sched.peek_suffix_hit(request.request_id) is None
 
 

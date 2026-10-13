@@ -351,7 +351,7 @@ class Scheduler(SchedulerInterface):
 
         # {req_id: (gap_end, suffix_end)} in tokens, for scheduled requests
         # admitted with a suffix hit that have not computed their gap yet.
-        self._suffix_hits: dict[str, tuple[int, int]] = {}
+        self._suffix_hits: dict[str, list[tuple[int, int]]] = {}
         # Requests whose offload suffix has been loaded into already-allocated
         # blocks; the next WAITING schedule recomputes the gap then jumps.
         self._offload_suffix_ready: set[str] = set()
@@ -721,9 +721,25 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
             )
             if (suffix_hit := self._suffix_hits.get(request.request_id)) is not None:
-                num_new_tokens = min(
-                    num_new_tokens, suffix_hit[0] - request.num_computed_tokens
-                )
+                while (
+                    suffix_hit
+                    and request.num_computed_tokens >= suffix_hit[0][0]
+                ):
+                    span_end = suffix_hit.pop(0)[1]
+                    if (
+                        not suffix_hit
+                        and span_end == request.num_tokens
+                        and self.num_sampled_tokens_per_step > 0
+                    ):
+                        span_end -= self.num_sampled_tokens_per_step
+                    request.num_computed_tokens = span_end
+                if not suffix_hit:
+                    del self._suffix_hits[request.request_id]
+                else:
+                    num_new_tokens = min(
+                        num_new_tokens,
+                        suffix_hit[0][0] - request.num_computed_tokens,
+                    )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
@@ -986,7 +1002,10 @@ class Scheduler(SchedulerInterface):
                     if offload_suffix_resume:
                         suffix_hit = self._suffix_hits.get(request_id)
                         assert suffix_hit is not None
-                        num_suffix_hit_tokens = suffix_hit[1] - suffix_hit[0]
+                        num_suffix_hit_tokens = sum(
+                            span_end - span_start
+                            for span_start, span_end in suffix_hit
+                        )
                         new_computed_blocks = (
                             self.kv_cache_manager.empty_kv_cache_blocks
                         )
@@ -1008,6 +1027,7 @@ class Scheduler(SchedulerInterface):
                         )
                         if suffix_hit is not None:
                             num_suffix_hit_tokens = suffix_hit[1] - suffix_hit[0]
+                            suffix_hit = [suffix_hit]
 
                     # Get externally-cached tokens if using a KVConnector.
                     if (
@@ -1177,7 +1197,20 @@ class Scheduler(SchedulerInterface):
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
                     if suffix_hit is not None:
-                        num_new_tokens = suffix_hit[0] - num_computed_tokens
+                        while suffix_hit and num_computed_tokens >= suffix_hit[0][0]:
+                            span_end = suffix_hit.pop(0)[1]
+                            if (
+                                not suffix_hit
+                                and span_end == request.num_tokens
+                                and self.num_sampled_tokens_per_step > 0
+                            ):
+                                span_end -= self.num_sampled_tokens_per_step
+                            num_computed_tokens = span_end
+                        if not suffix_hit:
+                            self._suffix_hits.pop(request_id, None)
+                            suffix_hit = None
+                        else:
+                            num_new_tokens = suffix_hit[0][0] - num_computed_tokens
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1357,15 +1390,17 @@ class Scheduler(SchedulerInterface):
                     )
                     # Suffix hits allocate through suffix_end (incl. gap) but
                     # only the loaded suffix counts as an external cache hit.
-                    offload_suffix: tuple[int, int] | None = None
+                    offload_suffix: list[tuple[int, int]] | None = None
                     peek_suffix = getattr(
                         self.connector, "get_offload_suffix_hit", None
                     )
                     if peek_suffix is not None and connector_prefix_cache_hits:
                         offload_suffix = peek_suffix(request)
                         if offload_suffix is not None:
-                            gap_end, suffix_end = offload_suffix
-                            connector_prefix_cache_hits = suffix_end - gap_end
+                            connector_prefix_cache_hits = sum(
+                                span_end - span_start
+                                for span_start, span_end in offload_suffix
+                            )
                     # The connector knows the tier only after the load
                     # plan above exists.
                     preempted = request.num_preemptions > 0
@@ -1392,18 +1427,10 @@ class Scheduler(SchedulerInterface):
                             },
                         )
                         if offload_suffix is not None:
-                            gap_end, suffix_end = offload_suffix
                             logger.info(
-                                "Offload suffix hit: req_id=%s "
-                                "suffix_tokens=%d gap_tokens=%d "
-                                "gap=[%d, %d) suffix=[%d, %d)",
+                                "Offload hit spans: req_id=%s spans=%s",
                                 request_id,
-                                suffix_end - gap_end,
-                                gap_end - num_new_local_computed_tokens,
-                                num_new_local_computed_tokens,
-                                gap_end,
-                                gap_end,
-                                suffix_end,
+                                offload_suffix,
                             )
                     if (
                         self.connector_prefix_cache_stats is not None
@@ -1475,13 +1502,10 @@ class Scheduler(SchedulerInterface):
                 if suffix_hit is not None:
                     self._suffix_hits[request_id] = suffix_hit
                     logger.debug(
-                        "Request %s: suffix hit, computing tokens [%d, %d) "
-                        "then skipping cached tokens [%d, %d).",
+                        "Request %s: hit spans %s, computed tokens %d.",
                         request_id,
+                        suffix_hit,
                         num_computed_tokens,
-                        suffix_hit[0],
-                        suffix_hit[0],
-                        suffix_hit[1],
                     )
                 self._set_kv_fetch_stage(request, None)
                 logger.info(
@@ -1817,26 +1841,30 @@ class Scheduler(SchedulerInterface):
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
             suffix_hit = self._suffix_hits.get(req_id)
-            if suffix_hit is not None and request.num_computed_tokens >= suffix_hit[0]:
+            if (
+                suffix_hit is not None
+                and request.num_computed_tokens >= suffix_hit[0][0]
+            ):
+                span_start, suffix_end = suffix_hit.pop(0)
                 logger.info(
                     "Offload suffix jump: req_id=%s before=%d scheduled=%d "
                     "gap_end=%d suffix_end=%d prompt=%d output_placeholders=%d",
                     req_id,
                     request.num_computed_tokens,
                     num_scheduled_token,
-                    suffix_hit[0],
-                    suffix_hit[1],
+                    span_start,
+                    suffix_end,
                     request.num_tokens,
                     request.num_output_placeholders,
                 )
-                # The gap is scheduled; skip over the cached suffix. Keep
-                # the final prompt token pending so its logits can produce the
-                # first generated token. If we advance to prompt length here,
-                # the next scheduling pass computes zero new tokens forever.
-                del self._suffix_hits[req_id]
-                suffix_end = suffix_hit[1]
+                # The gap is scheduled; skip over this cached run. Keep the
+                # final prompt token pending so its logits can produce the
+                # first generated token.
+                if not suffix_hit:
+                    del self._suffix_hits[req_id]
                 if (
-                    suffix_end == request.num_tokens
+                    not suffix_hit
+                    and suffix_end == request.num_tokens
                     and self.num_sampled_tokens_per_step > 0
                 ):
                     suffix_end -= self.num_sampled_tokens_per_step
@@ -3405,35 +3433,19 @@ class Scheduler(SchedulerInterface):
             self._suffix_hits.pop(request.request_id, None)
             self._offload_suffix_ready.discard(request.request_id)
         elif offload_suffix is not None:
-            # Prefix-pruned offload: suffix (e.g. CDE) is loaded; gap (AB)
-            # must be recomputed before jumping past the suffix.
-            gap_end, suffix_end = offload_suffix
+            # Cached runs are loaded. Each hole before a run is recomputed,
+            # then the scheduler jumps over that run.
             self.kv_cache_manager.register_offload_suffix_hit(
-                request, gap_end, suffix_end
+                request, offload_suffix
             )
             request.num_computed_tokens = 0
             self._suffix_hits[request.request_id] = offload_suffix
             self._offload_suffix_ready.add(request.request_id)
-            if envs.VLLM_KV_CONNECTOR_HIT_LOG:
-                logger.info(
-                    "Offload suffix loaded: req_id=%s suffix_tokens=%d "
-                    "gap_tokens=%d gap=[0, %d) suffix=[%d, %d); "
-                    "will recompute gap then jump",
-                    request.request_id,
-                    suffix_end - gap_end,
-                    gap_end,
-                    gap_end,
-                    gap_end,
-                    suffix_end,
-                )
-            else:
-                logger.debug(
-                    "Request %s: offload suffix loaded [%d, %d); "
-                    "will recompute gap then jump",
-                    request.request_id,
-                    gap_end,
-                    suffix_end,
-                )
+            logger.debug(
+                "Request %s: offload hit spans %s; will recompute holes then jump",
+                request.request_id,
+                offload_suffix,
+            )
         else:
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.

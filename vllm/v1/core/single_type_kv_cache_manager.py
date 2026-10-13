@@ -756,7 +756,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         self._tier_len = 0
         # {req_id: (gap_end_block, suffix_end_block)} for requests admitted
         # with a suffix hit whose gap blocks are not all cached yet.
-        self._suffix_hit_reqs: dict[str, tuple[int, int]] = {}
+        self._suffix_hit_reqs: dict[str, list[tuple[int, int]]] = {}
 
     def enable_suffix_preserving_eviction(
         self,
@@ -885,7 +885,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         req_blocks.extend(gap_blocks)
         req_blocks.extend(new_computed_blocks[gap_end:])
         self.num_cached_block[request_id] = gap_start
-        self._suffix_hit_reqs[request_id] = (gap_end, len(req_blocks))
+        self._suffix_hit_reqs[request_id] = [(gap_end, len(req_blocks))]
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         self._suffix_hit_reqs.pop(request_id, None)
@@ -1007,21 +1007,33 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
-        suffix_hit = self._suffix_hit_reqs.get(request.request_id)
-        if suffix_hit is not None:
-            gap_end_block, suffix_end_block = suffix_hit
-            gap_end = gap_end_block * self.block_size
-            super().cache_blocks(
-                request,
-                min(num_tokens, gap_end),
-                retention_interval=retention_interval,
-                replay_boundaries=replay_boundaries,
-            )
-            if num_tokens < gap_end:
-                return
-            # The suffix blocks are cached already.
-            del self._suffix_hit_reqs[request.request_id]
-            self.num_cached_block[request.request_id] = suffix_end_block
+        suffix_hits = self._suffix_hit_reqs.get(request.request_id)
+        if suffix_hits:
+            while suffix_hits:
+                gap_end_block, suffix_end_block = suffix_hits[0]
+                gap_end = gap_end_block * self.block_size
+                super().cache_blocks(
+                    request,
+                    min(num_tokens, gap_end),
+                    retention_interval=retention_interval,
+                    replay_boundaries=replay_boundaries,
+                )
+                if num_tokens < gap_end:
+                    return
+                suffix_hits.pop(0)
+                self.num_cached_block[request.request_id] = suffix_end_block
+                if not suffix_hits:
+                    del self._suffix_hit_reqs[request.request_id]
+                    break
+                next_gap = suffix_hits[0][0] * self.block_size
+                if num_tokens < next_gap:
+                    super().cache_blocks(
+                        request,
+                        num_tokens,
+                        retention_interval=retention_interval,
+                        replay_boundaries=replay_boundaries,
+                    )
+                    return
         super().cache_blocks(
             request,
             num_tokens,

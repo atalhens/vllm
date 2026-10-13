@@ -379,12 +379,9 @@ class RequestOffloadState:
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
-    # When prefix pruning left a hole (e.g. AB missing, CDE cached), the first
-    # contiguous offload hit after the miss: absolute token indices
-    # [suffix_gap_end, suffix_end). The gap [local, suffix_gap_end) is
-    # recomputed; the suffix is loaded. Cleared after the load is planned.
-    suffix_gap_end: int | None = None
-    suffix_end: int | None = None
+    # Cached runs to load, as absolute token ranges [start, end). Holes
+    # between runs are recomputed. Empty when the hit is one contiguous prefix.
+    hit_spans: list[tuple[int, int]] = field(default_factory=list)
     # Loaded attention keys cover their token positions. Recurrent state
     # supports the whole reused external prefix.
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
@@ -714,46 +711,33 @@ class OffloadingConnectorScheduler:
                     break
         return hit_count if not defer_lookup else None
 
-    def _find_suffix_hit(
+    def _find_hit_runs(
         self,
         keys: Sequence[OffloadKey],
         req_context: ReqContext,
         req: Request,
         group_config: GroupOffloadConfig,
         start_chunk_idx: int,
-        num_prefix_hit_chunks: int,
-    ) -> tuple[int, int] | None:
-        """Find the first contiguous offload hit run after a prefix miss.
+    ) -> list[tuple[int, int]] | None:
+        """Return every contiguous cached run in ``keys``.
 
-        Mirrors GPU ``FullAttentionManager.find_suffix_hit``: after the miss
-        that ended the prefix, skip further misses and take the first cached
-        run (for example CDE when prefix pruning peeled AB, even if a later
-        block is gone). A miss ends that run. Tokens before it are recomputed;
-        tokens after it are computed once the scheduler jumps past the run.
-
-        Args:
-            keys: Offload keys for the query window (sliced from the request).
-            num_prefix_hit_chunks: Contiguous hits from the start of ``keys``.
-
-        Returns:
-            ``None`` if the backend deferred a lookup.
-            ``(0, 0)`` if no later run is cached.
-            ``(suffix_start_local_idx, num_suffix_chunks)`` otherwise.
+        A miss closes the current run and the scan continues, so several holes
+        in one request each keep the cached blocks on both sides. ``None``
+        means the backend deferred a lookup.
         """
         defer_lookup = False
+        runs: list[tuple[int, int]] = []
         run_start: int | None = None
         run_len = 0
-        # Index num_prefix_hit_chunks is the miss that ended the prefix (or
-        # past-the-end when the whole window hit — then there is no suffix).
-        for local_idx in range(num_prefix_hit_chunks + 1, len(keys)):
-            result = self.manager.lookup(keys[local_idx], req_context)
+        for local_idx, key in enumerate(keys):
+            result = self.manager.lookup(key, req_context)
             match result:
                 case LookupResult.HIT | LookupResult.HIT_PENDING:
                     self._events_tracker.record_lookup(
                         req,
                         group_config,
                         start_chunk_idx + local_idx,
-                        keys[local_idx],
+                        key,
                     )
                     if result is LookupResult.HIT_PENDING:
                         defer_lookup = True
@@ -761,20 +745,21 @@ class OffloadingConnectorScheduler:
                         run_start = local_idx
                     run_len += 1
                 case LookupResult.RETRY:
-                    # Keep scanning until a run starts so async lookups are
-                    # kicked off. Once a run has started, a retry means the
-                    # run's length is unknown.
                     defer_lookup = True
                     if run_start is not None:
-                        break
+                        runs.append((run_start, run_len))
+                        run_start = None
+                        run_len = 0
                 case LookupResult.MISS:
                     if run_start is not None:
-                        break
+                        runs.append((run_start, run_len))
+                        run_start = None
+                        run_len = 0
+        if run_start is not None:
+            runs.append((run_start, run_len))
         if defer_lookup:
             return None
-        if run_start is None:
-            return 0, 0
-        return run_start, run_len
+        return runs
 
     def _sliding_window_lookup(
         self,
@@ -857,11 +842,10 @@ class OffloadingConnectorScheduler:
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
-        # Cleared each lookup; set when prefix pruning left a hole (AB miss,
-        # CDE hit). The returned hit span covers through suffix_end so the
-        # scheduler allocates the gap; only the suffix is loaded.
-        req_status.suffix_gap_end = None
-        req_status.suffix_end = None
+        # Cleared each lookup. Set to every cached run when holes split the
+        # window. The returned hit length covers through the last run so the
+        # scheduler allocates the holes; only the runs themselves are loaded.
+        req_status.hit_spans = []
 
         # Tracks which eagle groups have already popped their volatile trailing chunk
         # in the current convergence iteration. Reset when a non-eagle group
@@ -923,7 +907,53 @@ class OffloadingConnectorScheduler:
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
                 num_hit_chunks: int | None
-                if sliding_window_size_in_chunks is None:
+                # Full attention can keep every cached run across holes.
+                # Sliding-window and eagle groups still need one contiguous hit.
+                hole_scan = (
+                    sliding_window_size_in_chunks is None
+                    and not self._sliding_window_groups
+                    and not is_eagle_unverified
+                )
+                if hole_scan:
+                    runs = self._find_hit_runs(
+                        offload_keys,
+                        req_status.req_context,
+                        req_status.req,
+                        group_config,
+                        start_chunk_idx,
+                    )
+                    if runs is None:
+                        defer_lookup = True
+                        continue
+                    has_hole = bool(runs) and (len(runs) > 1 or runs[0][0] != 0)
+                    if has_hole:
+                        spans: list[tuple[int, int]] = []
+                        for run_start, run_len in runs:
+                            span_start = (
+                                start_chunk_idx + run_start
+                            ) * tokens_per_chunk
+                            span_end = min(
+                                max_hit_size_tokens,
+                                span_start + run_len * tokens_per_chunk,
+                            )
+                            span_end = round_down(span_end, tokens_per_chunk)
+                            if span_end > span_start:
+                                spans.append((span_start, span_end))
+                        if not spans:
+                            return 0
+                        req_status.hit_spans = spans
+                        num_hit_tokens = spans[-1][1] - num_computed_tokens
+                        logger.debug(
+                            "Request %s offload hit spans %s after %s GPU tokens; "
+                            "holes between spans are recomputed",
+                            req_status.req.request_id,
+                            spans,
+                            num_computed_tokens,
+                        )
+                        lookup_groups = ()
+                        break
+                    num_hit_chunks = runs[0][1] if runs else 0
+                elif sliding_window_size_in_chunks is None:
                     num_hit_chunks = self._maximal_prefix_lookup(
                         offload_keys,
                         req_status.req_context,
@@ -949,67 +979,6 @@ class OffloadingConnectorScheduler:
                         req_status.req_context,
                         initial_window + int(is_eagle_unverified),
                     )
-                # A miss ends the contiguous prefix. Prefix pruning can still
-                # have left a later run (AB gone, or a short prefix then a
-                # hole, with CDE cached). Keep scanning instead of treating
-                # that first miss as a total miss. Only unitary full-attention
-                # loads do this — SWA / eagle / hybrid convergence still
-                # require a contiguous prefix.
-                can_suffix = (
-                    num_hit_chunks is not None
-                    and num_hit_chunks < len(offload_keys)
-                    and sliding_window_size_in_chunks is None
-                    and not self._sliding_window_groups
-                    and not is_eagle_unverified
-                )
-                if can_suffix:
-                    suffix = self._find_suffix_hit(
-                        offload_keys,
-                        req_status.req_context,
-                        req_status.req,
-                        group_config,
-                        start_chunk_idx,
-                        num_prefix_hit_chunks=num_hit_chunks,
-                    )
-                    if suffix is None:
-                        defer_lookup = True
-                        continue
-                    suffix_start, suffix_count = suffix
-                    # One load region per group. A leading hole plus one run
-                    # is loaded as the suffix and the hole is recomputed.
-                    # Prefer that when it covers more chunks than the prefix;
-                    # otherwise keep the prefix (a longer suffix is not
-                    # discarded just because one later block misses).
-                    if suffix_count <= num_hit_chunks:
-                        if num_hit_chunks == 0:
-                            return 0
-                        suffix_count = 0
-                    if suffix_count > 0:
-                        gap_end = (start_chunk_idx + suffix_start) * tokens_per_chunk
-                        suffix_end = min(
-                            max_hit_size_tokens,
-                            gap_end + suffix_count * tokens_per_chunk,
-                        )
-                        suffix_end = round_down(suffix_end, tokens_per_chunk)
-                        if suffix_end <= gap_end:
-                            return 0
-                        req_status.suffix_gap_end = gap_end
-                        req_status.suffix_end = suffix_end
-                        num_hit_tokens = suffix_end - num_computed_tokens
-                        logger.debug(
-                            "Request %s offload suffix hit: gap [%s, %s), "
-                            "load [%s, %s) after %s GPU hit tokens",
-                            req_status.req.request_id,
-                            num_computed_tokens,
-                            gap_end,
-                            gap_end,
-                            suffix_end,
-                            num_computed_tokens,
-                        )
-                        # Suffix span is authoritative; no further group tighten.
-                        lookup_groups = ()
-                        break
-
                 if num_hit_chunks is None:
                     defer_lookup = True
                 else:
@@ -1060,13 +1029,17 @@ class OffloadingConnectorScheduler:
                     num_computed_tokens + num_hit_tokens
                 )
                 offload_keys = group_state.offload_keys
-                if req_status.suffix_gap_end is not None:
-                    # Only the suffix range is loaded.
-                    start_chunk_idx = (
-                        req_status.suffix_gap_end // tokens_per_chunk
-                    )
-                    num_chunks = cdiv(req_status.suffix_end or 0, tokens_per_chunk)
-                    offload_keys = offload_keys[start_chunk_idx:num_chunks]
+                if req_status.hit_spans:
+                    loaded_keys = []
+                    for span_start, span_end in req_status.hit_spans:
+                        loaded_keys.extend(
+                            offload_keys[
+                                span_start // tokens_per_chunk : cdiv(
+                                    span_end, tokens_per_chunk
+                                )
+                            ]
+                        )
+                    offload_keys = loaded_keys
                 else:
                     num_chunks = cdiv(
                         num_computed_tokens + num_hit_tokens, tokens_per_chunk
@@ -1116,7 +1089,7 @@ class OffloadingConnectorScheduler:
             return complete_hit
         # Suffix hits already end on a chunk boundary; extending a partial
         # tail past a peeled gap is not defined.
-        if req_status.suffix_gap_end is not None:
+        if req_status.hit_spans:
             return complete_hit
 
         local_tokens = req_status.num_locally_computed_tokens
@@ -1311,29 +1284,25 @@ class OffloadingConnectorScheduler:
             )
         return sources
 
-    def take_suffix_hit(self, request_id: str) -> tuple[int, int] | None:
-        """Return and clear a pending offload suffix hit ``(gap_end, suffix_end)``.
+    def take_suffix_hit(self, request_id: str) -> list[tuple[int, int]] | None:
+        """Return and clear pending offload hit spans ``[(start, end), ...]``.
 
-        Set during lookup when prefix pruning left a hole; consumed by the
-        main scheduler after the async load finishes so it can recompute the
-        gap and jump past the loaded suffix.
+        Set during lookup when cached runs are split by holes. The main
+        scheduler recomputes each hole and jumps over each loaded run.
         """
         req_status = self._req_status.get(request_id)
-        if req_status is None or req_status.suffix_gap_end is None:
+        if req_status is None or not req_status.hit_spans:
             return None
-        assert req_status.suffix_end is not None
-        hit = (req_status.suffix_gap_end, req_status.suffix_end)
-        req_status.suffix_gap_end = None
-        req_status.suffix_end = None
+        hit = list(req_status.hit_spans)
+        req_status.hit_spans = []
         return hit
 
-    def peek_suffix_hit(self, request_id: str) -> tuple[int, int] | None:
-        """Return a pending offload suffix hit without clearing it."""
+    def peek_suffix_hit(self, request_id: str) -> list[tuple[int, int]] | None:
+        """Return pending offload hit spans without clearing them."""
         req_status = self._req_status.get(request_id)
-        if req_status is None or req_status.suffix_gap_end is None:
+        if req_status is None or not req_status.hit_spans:
             return None
-        assert req_status.suffix_end is not None
-        return (req_status.suffix_gap_end, req_status.suffix_end)
+        return list(req_status.hit_spans)
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
@@ -1344,23 +1313,17 @@ class OffloadingConnectorScheduler:
         req_status = self._req_status[request.request_id]
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
-        suffix_gap_end = req_status.suffix_gap_end
-        suffix_end = req_status.suffix_end
-        # A suffix hit reports only the reusable suffix as external tokens, but
-        # allocation/load geometry includes the recomputed gap before it. Using
-        # num_external_tokens here truncates the destination block range at the
-        # suffix length and leaves the tail of the loaded suffix unwritten.
+        hit_spans = req_status.hit_spans
+        # Hit spans cover through the last cached run, including holes, so
+        # allocation creates the blocks those runs are copied into.
         num_cached_tokens = (
-            suffix_end
-            if suffix_gap_end is not None and suffix_end is not None
+            hit_spans[-1][1]
+            if hit_spans
             else num_locally_computed_tokens + num_external_tokens
         )
         partial_tail_boundary = req_status.partial_tail_boundary
         if partial_tail_boundary is not None:
             assert partial_tail_boundary == num_cached_tokens
-        if suffix_gap_end is not None:
-            assert suffix_end is not None
-            assert suffix_gap_end <= suffix_end
 
         keys_to_load: list[OffloadKey] = []
         req_status.load_key_ranges.clear()
@@ -1368,6 +1331,7 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
+        group_segments: list[list[tuple[int, int]]] = []
         for group_config, group_state in zip(
             self.config.kv_group_configs,
             req_status.group_states,
@@ -1383,25 +1347,48 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
+            if hit_spans:
+                segments: list[tuple[int, int]] = []
+                for span_start, span_end in hit_spans:
+                    assert span_start % tokens_per_block == 0
+                    assert span_end % tokens_per_block == 0
+                    block_idx = span_start // tokens_per_block
+                    num_span_blocks = (span_end - span_start) // tokens_per_block
+                    chunk_idx = span_start // tokens_per_chunk
+                    num_span_chunks = (span_end - span_start) // tokens_per_chunk
+                    span_keys = offload_keys[chunk_idx : chunk_idx + num_span_chunks]
+                    keys_to_load.extend(span_keys)
+                    for offset, key in enumerate(span_keys):
+                        range_start = (chunk_idx + offset) * tokens_per_chunk
+                        req_status.load_key_ranges.append(
+                            (range_start, range_start + tokens_per_chunk, key)
+                        )
+                    dst_block_ids.extend(
+                        block.block_id
+                        for block in group_blocks[
+                            block_idx : block_idx + num_span_blocks
+                        ]
+                    )
+                    segments.append((block_idx, num_span_blocks))
+                group_sizes.append(sum(count for _, count in segments))
+                block_indices.append(segments[0][0] if segments else 0)
+                group_segments.append(segments)
+                continue
+
             # ``load_start_gpu_block_idx``: the index in ``group_blocks`` where the
             # load region begins -- a slice bound, not a count of computed blocks.
             # Scan from the computed boundary, not 0: sparse groups (Mamba,
             # SWA) legitimately hold non-null unhashed blocks below it.
             # Skip nulls (sentinel / out-of-retention padding).
-            if suffix_gap_end is not None:
-                # Load only the cached suffix; the gap is recomputed later.
-                assert suffix_gap_end % tokens_per_block == 0
-                load_start_gpu_block_idx = suffix_gap_end // tokens_per_block
-            else:
-                first_fresh_gpu_block_idx = cdiv(
-                    num_locally_computed_tokens, tokens_per_block
-                )
-                load_start_gpu_block_idx = num_gpu_blocks
-                for i in range(first_fresh_gpu_block_idx, num_gpu_blocks):
-                    block = group_blocks[i]
-                    if not block.is_null and block.block_hash is None:
-                        load_start_gpu_block_idx = i
-                        break
+            first_fresh_gpu_block_idx = cdiv(
+                num_locally_computed_tokens, tokens_per_block
+            )
+            load_start_gpu_block_idx = num_gpu_blocks
+            for i in range(first_fresh_gpu_block_idx, num_gpu_blocks):
+                block = group_blocks[i]
+                if not block.is_null and block.block_hash is None:
+                    load_start_gpu_block_idx = i
+                    break
 
             assert num_locally_computed_tokens % tokens_per_block == 0
             num_pending_gpu_blocks = num_gpu_blocks - load_start_gpu_block_idx
@@ -1460,22 +1447,26 @@ class OffloadingConnectorScheduler:
             )
             group_sizes.append(num_pending_gpu_blocks)
             block_indices.append(load_start_gpu_block_idx)
+            group_segments.append([(load_start_gpu_block_idx, num_pending_gpu_blocks)])
 
             # Skip prefix-hit chunks for block-level policy; for
             # request-level, next_stored_chunk_idx stays at 0 so all
             # chunks (including hits) are offloaded.
-            # For a suffix hit the gap must still be storeable after recompute,
+            # For a holed hit the gaps must still be storeable after recompute,
             # so leave next_stored_chunk_idx at 0 (prepare_store skips keys
             # that are already resident).
             if (
                 req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL
-                and suffix_gap_end is None
+                and not hit_spans
             ):
                 group_state.next_stored_chunk_idx = num_chunks
 
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
-            dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
+            dst_block_ids,
+            group_sizes=group_sizes,
+            block_indices=block_indices,
+            segments=group_segments,
         )
 
         load_job_id = self._generate_job_id()

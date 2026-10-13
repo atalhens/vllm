@@ -313,39 +313,40 @@ class KVCacheManager:
         return gap_end * block_size, len(blocks) * block_size
 
     def register_offload_suffix_hit(
-        self, request: Request, gap_end: int, suffix_end: int
+        self, request: Request, spans: list[tuple[int, int]]
     ) -> None:
-        """Register a suffix loaded from offload after prefix-pruning peeled the gap.
+        """Register every loaded run after a holed offload lookup.
 
-        Hashes the loaded suffix into the prefix cache without treating the
-        empty gap as cached, and records ``_suffix_hit_reqs`` so a later
-        ``cache_blocks`` of the recomputed gap jumps past the suffix — the same
-        contract as a GPU suffix hit from ``add_local_computed_blocks``.
+        Hashes each loaded run into the prefix cache without treating the
+        holes as cached, and records ``_suffix_hit_reqs`` so a later
+        ``cache_blocks`` of a recomputed hole jumps past the following run.
         """
-        if not self.enable_caching:
+        if not self.enable_caching or not spans:
             return
         manager = self.coordinator.single_type_managers[0]
         if type(manager) is not FullAttentionManager:
             return
         block_size = manager.block_size
-        assert gap_end % block_size == 0
-        assert suffix_end % block_size == 0
-        gap_end_block = gap_end // block_size
-        suffix_end_block = suffix_end // block_size
         req_id = request.request_id
-        manager.num_cached_block[req_id] = gap_end_block
         boundaries = self.coordinator.get_replay_boundaries(request)
-        SingleTypeKVCacheManager.cache_blocks(
-            manager,
-            request,
-            suffix_end,
-            retention_interval=self.coordinator.retention_interval,
-            replay_boundaries=boundaries,
-        )
-        # Gap still needs compute; suffix is hashed. Mirror a pure suffix hit
-        # (no surviving prefix): cached count stays at the gap start.
+        block_spans: list[tuple[int, int]] = []
+        for span_start, span_end in spans:
+            assert span_start % block_size == 0
+            assert span_end % block_size == 0
+            start_block = span_start // block_size
+            end_block = span_end // block_size
+            block_spans.append((start_block, end_block))
+            manager.num_cached_block[req_id] = start_block
+            SingleTypeKVCacheManager.cache_blocks(
+                manager,
+                request,
+                span_end,
+                retention_interval=self.coordinator.retention_interval,
+                replay_boundaries=boundaries,
+            )
+        # Holes still need compute. Cached count stays at the first hole.
         manager.num_cached_block[req_id] = 0
-        manager._suffix_hit_reqs[req_id] = (gap_end_block, suffix_end_block)
+        manager._suffix_hit_reqs[req_id] = block_spans
 
     @property
     def usage(self) -> float:

@@ -35,10 +35,7 @@ def test_prefix_pruning_reload_loads_suffix(request_runner, async_scheduling):
     # Phase 2: clear GPU cache; simulate prefix pruning (A,B gone, C,D,E cached).
     runner.scheduler.reset_prefix_cache()
     sched = runner.connector_scheduler
-    sched._maximal_prefix_lookup = lambda keys, ctx, *a, **k: 0
-    sched._find_suffix_hit = (
-        lambda keys, ctx, req, grp, start, num_prefix_hit_chunks: (2, 3)
-    )
+    sched._find_hit_runs = lambda keys, ctx, req, grp, start: [(2, 3)]
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output([])
     )
