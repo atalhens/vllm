@@ -1111,11 +1111,7 @@ class Scheduler(SchedulerInterface):
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens
                             + num_suffix_hit_tokens,
-                            num_external_cached_tokens=(
-                                num_external_computed_tokens
-                                if did_prefix_cache_lookup
-                                else num_suffix_hit_tokens
-                            ),
+                            num_external_cached_tokens=num_external_computed_tokens,
                         )
                     self._set_kv_fetch_stage(
                         request, KV_FETCH_WAITING_TO_START if load_kv_async else None
@@ -1336,6 +1332,7 @@ class Scheduler(SchedulerInterface):
                     )
                     # Suffix hits allocate through suffix_end (incl. gap) but
                     # only the loaded suffix counts as an external cache hit.
+                    offload_suffix: tuple[int, int] | None = None
                     peek_suffix = getattr(
                         self.connector, "get_offload_suffix_hit", None
                     )
@@ -1369,6 +1366,20 @@ class Scheduler(SchedulerInterface):
                                 for source, count in (hits_by_source or {}).items()
                             },
                         )
+                        if offload_suffix is not None:
+                            gap_end, suffix_end = offload_suffix
+                            logger.info(
+                                "Offload suffix hit: req_id=%s "
+                                "suffix_tokens=%d gap_tokens=%d "
+                                "gap=[%d, %d) suffix=[%d, %d)",
+                                request_id,
+                                suffix_end - gap_end,
+                                gap_end - num_new_local_computed_tokens,
+                                num_new_local_computed_tokens,
+                                gap_end,
+                                gap_end,
+                                suffix_end,
+                            )
                     if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
@@ -3329,13 +3340,26 @@ class Scheduler(SchedulerInterface):
             request.num_computed_tokens = 0
             self._suffix_hits[request.request_id] = offload_suffix
             self._offload_suffix_ready.add(request.request_id)
-            logger.debug(
-                "Request %s: offload suffix loaded [%d, %d); "
-                "will recompute gap then jump",
-                request.request_id,
-                gap_end,
-                suffix_end,
-            )
+            if envs.VLLM_KV_CONNECTOR_HIT_LOG:
+                logger.info(
+                    "Offload suffix loaded: req_id=%s suffix_tokens=%d "
+                    "gap_tokens=%d gap=[0, %d) suffix=[%d, %d); "
+                    "will recompute gap then jump",
+                    request.request_id,
+                    suffix_end - gap_end,
+                    gap_end,
+                    gap_end,
+                    gap_end,
+                    suffix_end,
+                )
+            else:
+                logger.debug(
+                    "Request %s: offload suffix loaded [%d, %d); "
+                    "will recompute gap then jump",
+                    request.request_id,
+                    gap_end,
+                    suffix_end,
+                )
         else:
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.

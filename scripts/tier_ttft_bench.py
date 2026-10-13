@@ -19,11 +19,11 @@ import matplotlib.pyplot as plt
 import requests
 from transformers import AutoTokenizer
 
-MODEL = "poolside/Laguna-XS-2.1"
+MODEL = "mistralai/Ministral-3-8B-Reasoning-2512"
 ENDPOINT = "http://127.0.0.1:8000/v1/completions"
 HEALTH = "http://127.0.0.1:8000/health"
-INPUT_LENS = [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000]
-# INPUT_LENS = [1000, 2000, 4000, 8000, 16000, 32000]
+# INPUT_LENS = [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000]
+INPUT_LENS = [256000, 257000]
 OUTPUT_LEN = 8
 CPU_BYTES = 107374182400
 BLOCK_SIZE = 256
@@ -159,7 +159,7 @@ def kv_transfer_config(root_dir: str) -> str:
                     "root_dir": root_dir,
                     "n_read_threads": 32,
                     "n_write_threads": 16,
-                    "capacity_bytes": 536870912000,
+                    "capacity_bytes": 48318382080,
                     "eviction_policy": "prefix_pruning",
                     "session_dead_ttl_s": 200,
                     "max_tiers": 8

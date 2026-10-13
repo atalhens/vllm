@@ -828,6 +828,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        prefill_end: int = 0,
     ) -> int:
         num_blocks = super().get_num_blocks_to_allocate(
             request_id,
@@ -837,6 +838,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             num_local_computed_tokens,
             num_tokens_main_model,
             apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
         )
         if self._prefix_evict_fraction is not None:
             # Gap placeholders of a suffix hit get new blocks on admission.

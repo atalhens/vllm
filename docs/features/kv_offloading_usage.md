@@ -175,6 +175,8 @@ By default the FS tier is **unbounded** and never deletes blocks. To bound it:
 - `capacity_bytes` + `eviction_policy: "reject"` — hard cap, reject writes past the budget (no deletion)
 
 See the dedicated [Storage-Tier Eviction](kv_offload_storage_eviction.md) guide.
+For how a peeled prefix is looked up again (load surviving suffix, recompute
+gap, jump), see [Prefix-Pruning Lookup](kv_offload_prefix_pruning_lookup.md).
 
 #### On-Disk Layout
 

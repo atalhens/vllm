@@ -6,6 +6,10 @@ controls it. It is a companion to the main
 [KV Offloading Usage Guide](kv_offloading_usage.md); read that first for the
 connector overview, the `TieringOffloadingSpec`, and the FS tier basics.
 
+After blocks are peeled, the next request may see a **hole** (shallow miss,
+deeper hit). How lookup reloads the surviving suffix and recomputes the gap is
+documented in [Prefix-Pruning Lookup](kv_offload_prefix_pruning_lookup.md).
+
 ## Why this exists
 
 By default the `fs` tier is **unbounded**: every completed block is written to
@@ -333,3 +337,8 @@ after enabling eviction. A healthy configuration keeps the disk within
 `capacity_bytes` while preserving the storage-tier hit rate; a steep hit-rate
 drop after enabling eviction usually means `capacity_bytes` is too small for the
 working set, or `session_dead_ttl_s` is too aggressive for your think times.
+
+When prefix pruning leaves a hole (shallow blocks gone, deeper blocks still
+cached), the same flag also emits `Offload suffix hit` /
+`Offload suffix loaded` lines with `suffix_tokens` and `gap_tokens`. See
+[Prefix-Pruning Lookup](kv_offload_prefix_pruning_lookup.md#observability).
