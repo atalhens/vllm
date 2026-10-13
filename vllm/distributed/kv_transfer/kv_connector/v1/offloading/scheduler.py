@@ -737,40 +737,37 @@ class OffloadingConnectorScheduler:
             ``(suffix_start_local_idx, num_suffix_chunks)`` otherwise.
         """
         defer_lookup = False
-        suffix_start: int | None = None
-        suffix_count = 0
+        run_start: int | None = None
         # Index num_prefix_hit_chunks is the miss that ended the prefix (or
         # past-the-end when the whole window hit — then there is no suffix).
+        # A valid suffix must reach the right edge of the request window. A
+        # cached run in the middle cannot be skipped: tokens after it still
+        # have to be recomputed, so accepting that run creates a false,
+        # incomplete hit and an invalid resume boundary.
         for local_idx in range(num_prefix_hit_chunks + 1, len(keys)):
             result = self.manager.lookup(keys[local_idx], req_context)
             match result:
-                case LookupResult.HIT:
+                case LookupResult.HIT | LookupResult.HIT_PENDING:
                     self._events_tracker.record_lookup(
                         req,
                         group_config,
                         start_chunk_idx + local_idx,
                         keys[local_idx],
                     )
-                    if suffix_start is None:
-                        suffix_start = local_idx
-                    suffix_count += 1
-                case LookupResult.HIT_PENDING:
-                    defer_lookup = True
-                    if suffix_start is None:
-                        suffix_start = local_idx
-                    suffix_count += 1
+                    if result is LookupResult.HIT_PENDING:
+                        defer_lookup = True
+                    if run_start is None:
+                        run_start = local_idx
                 case LookupResult.RETRY:
                     defer_lookup = True
-                    if suffix_start is not None:
-                        break
+                    run_start = None
                 case LookupResult.MISS:
-                    if suffix_start is not None:
-                        break
+                    run_start = None
         if defer_lookup:
             return None
-        if suffix_start is None:
+        if run_start is None:
             return 0, 0
-        return suffix_start, suffix_count
+        return run_start, len(keys) - run_start
 
     def _sliding_window_lookup(
         self,

@@ -2069,6 +2069,25 @@ class TestOffloadSuffixHit:
             == (0, 0)
         )
 
+    def test_find_suffix_hit_requires_run_to_reach_request_end(self):
+        # A middle run is not a reusable suffix: tokens after it still need
+        # recomputation and therefore cannot be skipped.
+        keys = to_keys([1, 2, 3, 4, 5, 6, 7, 8])
+        sched = _make_scheduler_with_lookup(
+            {3: LookupResult.HIT, 5: LookupResult.HIT, 6: LookupResult.HIT}
+        )
+        assert (
+            sched._find_suffix_hit(
+                keys,
+                _EMPTY_REQ_CTX,
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                start_chunk_idx=0,
+                num_prefix_hit_chunks=0,
+            )
+            == (0, 0)
+        )
+
     def test_find_suffix_hit_defers_on_retry(self):
         sched = _make_scheduler_with_lookup(
             {3: LookupResult.RETRY, 4: LookupResult.HIT}
