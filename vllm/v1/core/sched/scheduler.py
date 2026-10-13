@@ -658,6 +658,21 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if request.request_id in self._suffix_hits or request.num_computed_tokens >= request.num_prompt_tokens - 1:
+                logger.info(
+                    "Running suffix state: req_id=%s status=%s computed=%d "
+                    "prompt=%d num_tokens=%d in_flight=%d suffix=%s "
+                    "token_budget=%d input_budget=%d",
+                    request.request_id,
+                    request.status.name,
+                    request.num_computed_tokens,
+                    request.num_prompt_tokens,
+                    request.num_tokens,
+                    request.num_in_flight_tokens,
+                    self._suffix_hits.get(request.request_id),
+                    token_budget,
+                    input_budget,
+                )
             if input_budget <= draft_slots:
                 break
 
@@ -1814,19 +1829,13 @@ class Scheduler(SchedulerInterface):
                     request.num_tokens,
                     request.num_output_placeholders,
                 )
-                # The gap is scheduled; skip over the cached suffix. Keep the
-                # final prompt token pending: its KV may be loaded, but the
-                # model still has to execute that token to produce the first
-                # generation logits. This is the same one-token replay used
-                # for an ordinary full-prefix hit.
+                # The gap is scheduled; skip over the cached suffix. The
+                # terminal prompt token is already represented by the loaded
+                # suffix, so do not rewind the request below the prompt
+                # boundary. Rewinding here leaves the request marked as a
+                # prefill forever and prevents the decode step from running.
                 del self._suffix_hits[req_id]
-                suffix_end = suffix_hit[1]
-                if (
-                    suffix_end == request.num_tokens
-                    and self.num_sampled_tokens_per_step > 0
-                ):
-                    suffix_end -= self.num_sampled_tokens_per_step
-                request.num_computed_tokens = suffix_end
+                request.num_computed_tokens = suffix_hit[1]
                 logger.info(
                     "Offload suffix jump result: req_id=%s computed=%d "
                     "is_prefill=%s",
@@ -2372,6 +2381,19 @@ class Scheduler(SchedulerInterface):
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
+                )
+            if request.request_id in self._suffix_hits or request.num_computed_tokens >= request.num_prompt_tokens - 1:
+                logger.info(
+                    "Output suffix state: req_id=%s status_before=%s status_after=%s "
+                    "computed=%d prompt=%d sampled=%s stopped=%s stale=%s",
+                    req_id,
+                    status_before_stop.name,
+                    request.status.name,
+                    request.num_computed_tokens,
+                    request.num_prompt_tokens,
+                    generated_token_ids,
+                    stopped,
+                    output_is_stale,
                 )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
