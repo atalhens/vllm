@@ -1784,9 +1784,19 @@ class Scheduler(SchedulerInterface):
             request.num_computed_tokens += num_scheduled_token
             suffix_hit = self._suffix_hits.get(req_id)
             if suffix_hit is not None and request.num_computed_tokens >= suffix_hit[0]:
-                # The gap is scheduled; skip over the cached suffix.
+                # The gap is scheduled; skip over the cached suffix. Keep the
+                # final prompt token pending: its KV may be loaded, but the
+                # model still has to execute that token to produce the first
+                # generation logits. This is the same one-token replay used
+                # for an ordinary full-prefix hit.
                 del self._suffix_hits[req_id]
-                request.num_computed_tokens = suffix_hit[1]
+                suffix_end = suffix_hit[1]
+                if (
+                    suffix_end == request.num_tokens
+                    and self.num_sampled_tokens_per_step > 0
+                ):
+                    suffix_end -= self.num_sampled_tokens_per_step
+                request.num_computed_tokens = suffix_end
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.

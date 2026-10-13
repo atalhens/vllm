@@ -2088,6 +2088,23 @@ class TestOffloadSuffixHit:
             == (0, 0)
         )
 
+    def test_find_suffix_hit_accepts_only_terminal_run(self):
+        keys = to_keys([1, 2, 3, 4, 5, 6])
+        sched = _make_scheduler_with_lookup(
+            {3: LookupResult.HIT, 5: LookupResult.HIT, 6: LookupResult.HIT}
+        )
+        assert (
+            sched._find_suffix_hit(
+                keys,
+                _EMPTY_REQ_CTX,
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                start_chunk_idx=0,
+                num_prefix_hit_chunks=0,
+            )
+            == (4, 2)
+        )
+
     def test_find_suffix_hit_defers_on_retry(self):
         sched = _make_scheduler_with_lookup(
             {3: LookupResult.RETRY, 4: LookupResult.HIT}
