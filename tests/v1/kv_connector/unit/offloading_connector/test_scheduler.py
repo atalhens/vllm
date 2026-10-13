@@ -2148,10 +2148,14 @@ class TestOffloadSuffixHit:
             kv_cache_group_id=0,
             scheduler_block_size=block_size,
         )
+        # The scheduler reports the full span through the suffix (20 tokens),
+        # but the connector's external-hit count is only the loaded suffix
+        # (12 tokens); the first 8 tokens are the recomputed gap.
+        external_suffix_tokens = 12
         manager.add_local_computed_blocks(request.request_id, [], 0, external)
         manager.allocate_external_computed_blocks(request.request_id, 0, external)
         blocks = KVCacheBlocks((manager.req_to_blocks[request.request_id],))
-        sched.update_state_after_alloc(request, blocks, external)
+        sched.update_state_after_alloc(request, blocks, external_suffix_tokens)
 
         assert len(sched._jobs) == 1
         job = next(iter(sched._jobs.values()))

@@ -1309,13 +1309,23 @@ class OffloadingConnectorScheduler:
         req_status = self._req_status[request.request_id]
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
-        num_cached_tokens = num_locally_computed_tokens + num_external_tokens
+        suffix_gap_end = req_status.suffix_gap_end
+        suffix_end = req_status.suffix_end
+        # A suffix hit reports only the reusable suffix as external tokens, but
+        # allocation/load geometry includes the recomputed gap before it. Using
+        # num_external_tokens here truncates the destination block range at the
+        # suffix length and leaves the tail of the loaded suffix unwritten.
+        num_cached_tokens = (
+            suffix_end
+            if suffix_gap_end is not None and suffix_end is not None
+            else num_locally_computed_tokens + num_external_tokens
+        )
         partial_tail_boundary = req_status.partial_tail_boundary
         if partial_tail_boundary is not None:
             assert partial_tail_boundary == num_cached_tokens
-        suffix_gap_end = req_status.suffix_gap_end
         if suffix_gap_end is not None:
-            assert req_status.suffix_end == num_cached_tokens
+            assert suffix_end is not None
+            assert suffix_gap_end <= suffix_end
 
         keys_to_load: list[OffloadKey] = []
         req_status.load_key_ranges.clear()
