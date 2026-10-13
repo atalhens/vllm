@@ -1319,6 +1319,16 @@ class Scheduler(SchedulerInterface):
 
                 if offload_suffix_resume:
                     self._offload_suffix_ready.discard(request_id)
+                    logger.info(
+                        "Offload suffix resume admitted: req_id=%s status=%s "
+                        "computed=%d scheduled=%d suffix=%s blocks=%s",
+                        request_id,
+                        request.status.name,
+                        request.num_computed_tokens,
+                        num_new_tokens,
+                        suffix_hit,
+                        self.kv_cache_manager.get_block_ids(request_id),
+                    )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1459,6 +1469,15 @@ class Scheduler(SchedulerInterface):
                         suffix_hit[1],
                     )
                 self._set_kv_fetch_stage(request, None)
+                logger.info(
+                    "Request admitted to RUNNING: req_id=%s computed=%d "
+                    "scheduled=%d suffix=%s load_async=%s",
+                    request_id,
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    suffix_hit,
+                    load_kv_async,
+                )
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
@@ -1784,6 +1803,17 @@ class Scheduler(SchedulerInterface):
             request.num_computed_tokens += num_scheduled_token
             suffix_hit = self._suffix_hits.get(req_id)
             if suffix_hit is not None and request.num_computed_tokens >= suffix_hit[0]:
+                logger.info(
+                    "Offload suffix jump: req_id=%s before=%d scheduled=%d "
+                    "gap_end=%d suffix_end=%d prompt=%d output_placeholders=%d",
+                    req_id,
+                    request.num_computed_tokens,
+                    num_scheduled_token,
+                    suffix_hit[0],
+                    suffix_hit[1],
+                    request.num_tokens,
+                    request.num_output_placeholders,
+                )
                 # The gap is scheduled; skip over the cached suffix. Keep the
                 # final prompt token pending: its KV may be loaded, but the
                 # model still has to execute that token to produce the first
@@ -1797,6 +1827,13 @@ class Scheduler(SchedulerInterface):
                 ):
                     suffix_end -= self.num_sampled_tokens_per_step
                 request.num_computed_tokens = suffix_end
+                logger.info(
+                    "Offload suffix jump result: req_id=%s computed=%d "
+                    "is_prefill=%s",
+                    req_id,
+                    request.num_computed_tokens,
+                    request.num_computed_tokens < request.num_tokens,
+                )
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -3375,6 +3412,16 @@ class Scheduler(SchedulerInterface):
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
+        logger.info(
+            "Remote KV completion: req_id=%s failed=%s offload_suffix=%s "
+            "status=%s computed_before_replay=%d blocks=%s",
+            request.request_id,
+            load_failed,
+            offload_suffix,
+            request.status.name,
+            request.num_computed_tokens,
+            self.kv_cache_manager.get_block_ids(request.request_id),
+        )
         if offload_suffix is None:
             # DSV41 SWA bounded replay recomputes the tail of a hit loaded
             # without its window, or of a failed load, which may have lost

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from collections import Counter
+
+import vllm.envs as envs
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import chain, islice
@@ -1242,7 +1244,14 @@ class OffloadingConnectorScheduler:
         if num_external_tokens == 0:
             return sources
         req_status = self._req_status[request.request_id]
+        # Normally external tokens begin immediately after the local prefix.
+        # A prefix-pruned suffix is different: the load ranges begin at the
+        # suffix gap end, while the gap itself is recomputed and is not an
+        # external hit. Anchor source accounting at the actual load range so
+        # the recomputed gap is not mislabeled external_unspecified.
         start = req_status.num_locally_computed_tokens
+        if req_status.load_key_ranges:
+            start = min(lo for lo, _hi, _key in req_status.load_key_ranges)
         end = start + num_external_tokens
 
         events: list[tuple[int, int, CacheHitSource]] = [
@@ -1271,6 +1280,21 @@ class OffloadingConnectorScheduler:
                 sources[tier] = sources.get(tier, 0) + boundary - position
             active[source] += delta
             position = boundary
+        if envs.VLLM_KV_CONNECTOR_HIT_LOG:
+            logger.info(
+                "Offload source ranges: req_id=%s local=%d requested_external=%d "
+                "accounted=[%d,%d) ranges=%s sources=%s",
+                request.request_id,
+                req_status.num_locally_computed_tokens,
+                num_external_tokens,
+                start,
+                end,
+                [
+                    (lo, hi, key, self.manager.get_load_source(key, req_status.req_context))
+                    for lo, hi, key in req_status.load_key_ranges
+                ],
+                {source.value: count for source, count in sources.items()},
+            )
         return sources
 
     def take_suffix_hit(self, request_id: str) -> tuple[int, int] | None:
