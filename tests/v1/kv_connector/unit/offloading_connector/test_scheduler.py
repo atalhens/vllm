@@ -2069,9 +2069,9 @@ class TestOffloadSuffixHit:
             == (0, 0)
         )
 
-    def test_find_suffix_hit_requires_run_to_reach_request_end(self):
-        # A middle run is not a reusable suffix: tokens after it still need
-        # recomputation and therefore cannot be skipped.
+    def test_find_suffix_hit_keeps_first_run_when_a_later_block_misses(self):
+        # Same as GPU find_suffix_hit: the first cached run is reusable.
+        # A later miss ends it; tokens after the run are computed after the jump.
         keys = to_keys([1, 2, 3, 4, 5, 6, 7, 8])
         sched = _make_scheduler_with_lookup(
             {3: LookupResult.HIT, 5: LookupResult.HIT, 6: LookupResult.HIT}
@@ -2085,10 +2085,10 @@ class TestOffloadSuffixHit:
                 start_chunk_idx=0,
                 num_prefix_hit_chunks=0,
             )
-            == (0, 0)
+            == (2, 1)
         )
 
-    def test_find_suffix_hit_accepts_only_terminal_run(self):
+    def test_find_suffix_hit_stops_at_hole_inside_suffix(self):
         keys = to_keys([1, 2, 3, 4, 5, 6])
         sched = _make_scheduler_with_lookup(
             {3: LookupResult.HIT, 5: LookupResult.HIT, 6: LookupResult.HIT}
@@ -2102,7 +2102,25 @@ class TestOffloadSuffixHit:
                 start_chunk_idx=0,
                 num_prefix_hit_chunks=0,
             )
-            == (4, 2)
+            == (2, 1)
+        )
+
+    def test_find_suffix_hit_after_partial_prefix(self):
+        # Block 1 is present, 2 is the miss that ends the prefix, 4-5 remain.
+        keys = to_keys([1, 2, 3, 4, 5])
+        sched = _make_scheduler_with_lookup(
+            {1: LookupResult.HIT, 4: LookupResult.HIT, 5: LookupResult.HIT}
+        )
+        assert (
+            sched._find_suffix_hit(
+                keys,
+                _EMPTY_REQ_CTX,
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                start_chunk_idx=0,
+                num_prefix_hit_chunks=1,
+            )
+            == (3, 2)
         )
 
     def test_find_suffix_hit_defers_on_retry(self):
@@ -2144,6 +2162,29 @@ class TestOffloadSuffixHit:
         assert sched._lookup(req_status) == 20
         assert req_status.suffix_gap_end == 8
         assert req_status.suffix_end == 20
+
+    def test_lookup_keeps_suffix_when_tail_block_misses(self, request_runner):
+        """A later miss must not discard the cached run in front of it."""
+        block_size = 4
+        runner = request_runner(
+            block_size=block_size,
+            num_gpu_blocks=100,
+            async_scheduling=False,
+        )
+        runner.manager.lookup.side_effect = lambda key, req_context: (
+            LookupResult.HIT
+            if int(get_offload_block_hash(key).decode()) in {3, 4}
+            else LookupResult.MISS
+        )
+        sched = runner.connector_scheduler
+        req_status = TestEagle._make_req_status(
+            sched,
+            num_tokens=32,
+            offload_keys_per_group=[[1, 2, 3, 4, 5, 6, 7, 8]],
+        )
+        assert sched._lookup(req_status) == 16
+        assert req_status.suffix_gap_end == 8
+        assert req_status.suffix_end == 16
 
     def test_update_state_after_alloc_loads_only_suffix(self, request_runner):
         block_size = 4

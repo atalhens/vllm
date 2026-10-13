@@ -726,8 +726,10 @@ class OffloadingConnectorScheduler:
         """Find the first contiguous offload hit run after a prefix miss.
 
         Mirrors GPU ``FullAttentionManager.find_suffix_hit``: after the miss
-        that ended the prefix, scan for the first cached run (e.g. CDE when
-        AB were peeled by prefix pruning).
+        that ended the prefix, skip further misses and take the first cached
+        run (for example CDE when prefix pruning peeled AB, even if a later
+        block is gone). A miss ends that run. Tokens before it are recomputed;
+        tokens after it are computed once the scheduler jumps past the run.
 
         Args:
             keys: Offload keys for the query window (sliced from the request).
@@ -740,12 +742,9 @@ class OffloadingConnectorScheduler:
         """
         defer_lookup = False
         run_start: int | None = None
+        run_len = 0
         # Index num_prefix_hit_chunks is the miss that ended the prefix (or
         # past-the-end when the whole window hit — then there is no suffix).
-        # A valid suffix must reach the right edge of the request window. A
-        # cached run in the middle cannot be skipped: tokens after it still
-        # have to be recomputed, so accepting that run creates a false,
-        # incomplete hit and an invalid resume boundary.
         for local_idx in range(num_prefix_hit_chunks + 1, len(keys)):
             result = self.manager.lookup(keys[local_idx], req_context)
             match result:
@@ -760,16 +759,22 @@ class OffloadingConnectorScheduler:
                         defer_lookup = True
                     if run_start is None:
                         run_start = local_idx
+                    run_len += 1
                 case LookupResult.RETRY:
+                    # Keep scanning until a run starts so async lookups are
+                    # kicked off. Once a run has started, a retry means the
+                    # run's length is unknown.
                     defer_lookup = True
-                    run_start = None
+                    if run_start is not None:
+                        break
                 case LookupResult.MISS:
-                    run_start = None
+                    if run_start is not None:
+                        break
         if defer_lookup:
             return None
         if run_start is None:
             return 0, 0
-        return run_start, len(keys) - run_start
+        return run_start, run_len
 
     def _sliding_window_lookup(
         self,
@@ -944,57 +949,66 @@ class OffloadingConnectorScheduler:
                         req_status.req_context,
                         initial_window + int(is_eagle_unverified),
                     )
-                if num_hit_chunks == 0:
-                    # Prefix miss: look for a later contiguous run left by
-                    # prefix-pruning eviction (e.g. AB gone, CDE cached).
-                    # Only for unitary full-attention loads — SWA / eagle /
-                    # hybrid lookup convergence still require a contiguous
-                    # prefix.
-                    can_suffix = (
-                        sliding_window_size_in_chunks is None
-                        and not self._sliding_window_groups
-                        and not is_eagle_unverified
-                    )
-                    if not can_suffix:
-                        return 0
+                # A miss ends the contiguous prefix. Prefix pruning can still
+                # have left a later run (AB gone, or a short prefix then a
+                # hole, with CDE cached). Keep scanning instead of treating
+                # that first miss as a total miss. Only unitary full-attention
+                # loads do this — SWA / eagle / hybrid convergence still
+                # require a contiguous prefix.
+                can_suffix = (
+                    num_hit_chunks is not None
+                    and num_hit_chunks < len(offload_keys)
+                    and sliding_window_size_in_chunks is None
+                    and not self._sliding_window_groups
+                    and not is_eagle_unverified
+                )
+                if can_suffix:
                     suffix = self._find_suffix_hit(
                         offload_keys,
                         req_status.req_context,
                         req_status.req,
                         group_config,
                         start_chunk_idx,
-                        num_prefix_hit_chunks=0,
+                        num_prefix_hit_chunks=num_hit_chunks,
                     )
                     if suffix is None:
                         defer_lookup = True
                         continue
                     suffix_start, suffix_count = suffix
-                    if suffix_count == 0:
-                        return 0
-                    gap_end = (start_chunk_idx + suffix_start) * tokens_per_chunk
-                    suffix_end = min(
-                        max_hit_size_tokens,
-                        gap_end + suffix_count * tokens_per_chunk,
-                    )
-                    suffix_end = round_down(suffix_end, tokens_per_chunk)
-                    if suffix_end <= gap_end:
-                        return 0
-                    req_status.suffix_gap_end = gap_end
-                    req_status.suffix_end = suffix_end
-                    num_hit_tokens = suffix_end - num_computed_tokens
-                    logger.debug(
-                        "Request %s offload suffix hit: gap [%s, %s), "
-                        "load [%s, %s) after %s GPU hit tokens",
-                        req_status.req.request_id,
-                        num_computed_tokens,
-                        gap_end,
-                        gap_end,
-                        suffix_end,
-                        num_computed_tokens,
-                    )
-                    # Suffix span is authoritative; no further group tighten.
-                    lookup_groups = ()
-                    break
+                    # One load region per group. A leading hole plus one run
+                    # is loaded as the suffix and the hole is recomputed.
+                    # Prefer that when it covers more chunks than the prefix;
+                    # otherwise keep the prefix (a longer suffix is not
+                    # discarded just because one later block misses).
+                    if suffix_count <= num_hit_chunks:
+                        if num_hit_chunks == 0:
+                            return 0
+                        suffix_count = 0
+                    if suffix_count > 0:
+                        gap_end = (start_chunk_idx + suffix_start) * tokens_per_chunk
+                        suffix_end = min(
+                            max_hit_size_tokens,
+                            gap_end + suffix_count * tokens_per_chunk,
+                        )
+                        suffix_end = round_down(suffix_end, tokens_per_chunk)
+                        if suffix_end <= gap_end:
+                            return 0
+                        req_status.suffix_gap_end = gap_end
+                        req_status.suffix_end = suffix_end
+                        num_hit_tokens = suffix_end - num_computed_tokens
+                        logger.debug(
+                            "Request %s offload suffix hit: gap [%s, %s), "
+                            "load [%s, %s) after %s GPU hit tokens",
+                            req_status.req.request_id,
+                            num_computed_tokens,
+                            gap_end,
+                            gap_end,
+                            suffix_end,
+                            num_computed_tokens,
+                        )
+                        # Suffix span is authoritative; no further group tighten.
+                        lookup_groups = ()
+                        break
 
                 if num_hit_chunks is None:
                     defer_lookup = True
