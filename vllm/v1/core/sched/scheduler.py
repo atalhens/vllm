@@ -1829,18 +1829,12 @@ class Scheduler(SchedulerInterface):
                     request.num_tokens,
                     request.num_output_placeholders,
                 )
-                # The gap is scheduled; skip over the cached suffix. Keep
-                # the final prompt token pending so its logits can produce the
-                # first generated token. If we advance to prompt length here,
-                # the next scheduling pass computes zero new tokens forever.
+                # The loaded suffix already contains the terminal prompt
+                # context. Resume at its end so the next scheduler step is a
+                # decode step; leaving the request one token short makes it a
+                # prefill-only step and no sampled token is produced.
                 del self._suffix_hits[req_id]
-                suffix_end = suffix_hit[1]
-                if (
-                    suffix_end == request.num_tokens
-                    and self.num_sampled_tokens_per_step > 0
-                ):
-                    suffix_end -= self.num_sampled_tokens_per_step
-                request.num_computed_tokens = suffix_end
+                request.num_computed_tokens = suffix_hit[1]
                 logger.info(
                     "Offload suffix jump result: req_id=%s computed=%d "
                     "is_prefill=%s",
