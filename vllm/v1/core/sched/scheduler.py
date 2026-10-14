@@ -658,21 +658,21 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            if request.request_id in self._suffix_hits:
-                logger.info(
-                    "Running suffix state: req_id=%s status=%s computed=%d "
-                    "prompt=%d num_tokens=%d in_flight=%d suffix=%s "
-                    "token_budget=%d input_budget=%d",
-                    request.request_id,
-                    request.status.name,
-                    request.num_computed_tokens,
-                    request.num_prompt_tokens,
-                    request.num_tokens,
-                    request.num_in_flight_tokens,
-                    self._suffix_hits.get(request.request_id),
-                    token_budget,
-                    input_budget,
-                )
+            # if request.request_id in self._suffix_hits:
+            #     logger.info(
+            #         "Running suffix state: req_id=%s status=%s computed=%d "
+            #         "prompt=%d num_tokens=%d in_flight=%d suffix=%s "
+            #         "token_budget=%d input_budget=%d",
+            #         request.request_id,
+            #         request.status.name,
+            #         request.num_computed_tokens,
+            #         request.num_prompt_tokens,
+            #         request.num_tokens,
+            #         request.num_in_flight_tokens,
+            #         self._suffix_hits.get(request.request_id),
+            #         token_budget,
+            #         input_budget,
+            #     )
             if input_budget <= draft_slots:
                 break
 
@@ -1332,18 +1332,18 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
-                if offload_suffix_resume:
-                    self._offload_suffix_ready.discard(request_id)
-                    logger.info(
-                        "Offload suffix resume admitted: req_id=%s status=%s "
-                        "computed=%d scheduled=%d suffix=%s blocks=%s",
-                        request_id,
-                        request.status.name,
-                        request.num_computed_tokens,
-                        num_new_tokens,
-                        suffix_hit,
-                        self.kv_cache_manager.get_block_ids(request_id),
-                    )
+                # if offload_suffix_resume:
+                #     self._offload_suffix_ready.discard(request_id)
+                #     logger.info(
+                #         "Offload suffix resume admitted: req_id=%s status=%s "
+                #         "computed=%d scheduled=%d suffix=%s blocks=%s",
+                #         request_id,
+                #         request.status.name,
+                #         request.num_computed_tokens,
+                #         num_new_tokens,
+                #         suffix_hit,
+                #         self.kv_cache_manager.get_block_ids(request_id),
+                #     )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1391,20 +1391,20 @@ class Scheduler(SchedulerInterface):
                                 for source, count in (hits_by_source or {}).items()
                             },
                         )
-                        if offload_suffix is not None:
-                            gap_end, suffix_end = offload_suffix
-                            logger.info(
-                                "Offload suffix hit: req_id=%s "
-                                "suffix_tokens=%d gap_tokens=%d "
-                                "gap=[%d, %d) suffix=[%d, %d)",
-                                request_id,
-                                suffix_end - gap_end,
-                                gap_end - num_new_local_computed_tokens,
-                                num_new_local_computed_tokens,
-                                gap_end,
-                                gap_end,
-                                suffix_end,
-                            )
+                        # if offload_suffix is not None:
+                        #     gap_end, suffix_end = offload_suffix
+                        #     logger.info(
+                        #         "Offload suffix hit: req_id=%s "
+                        #         "suffix_tokens=%d gap_tokens=%d "
+                        #         "gap=[%d, %d) suffix=[%d, %d)",
+                        #         request_id,
+                        #         suffix_end - gap_end,
+                        #         gap_end - num_new_local_computed_tokens,
+                        #         num_new_local_computed_tokens,
+                        #         gap_end,
+                        #         gap_end,
+                        #         suffix_end,
+                        #     )
                     if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
@@ -1484,15 +1484,15 @@ class Scheduler(SchedulerInterface):
                         suffix_hit[1],
                     )
                 self._set_kv_fetch_stage(request, None)
-                logger.info(
-                    "Request admitted to RUNNING: req_id=%s computed=%d "
-                    "scheduled=%d suffix=%s load_async=%s",
-                    request_id,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    suffix_hit,
-                    load_kv_async,
-                )
+                # logger.info(
+                #     "Request admitted to RUNNING: req_id=%s computed=%d "
+                #     "scheduled=%d suffix=%s load_async=%s",
+                #     request_id,
+                #     request.num_computed_tokens,
+                #     num_new_tokens,
+                #     suffix_hit,
+                #     load_kv_async,
+                # )
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
@@ -1819,17 +1819,17 @@ class Scheduler(SchedulerInterface):
             suffix_hit = self._suffix_hits.get(req_id)
             suffix_decode_replay = False
             if suffix_hit is not None and request.num_computed_tokens >= suffix_hit[0]:
-                logger.info(
-                    "Offload suffix jump: req_id=%s before=%d scheduled=%d "
-                    "gap_end=%d suffix_end=%d prompt=%d output_placeholders=%d",
-                    req_id,
-                    request.num_computed_tokens,
-                    num_scheduled_token,
-                    suffix_hit[0],
-                    suffix_hit[1],
-                    request.num_tokens,
-                    request.num_output_placeholders,
-                )
+                # logger.info(
+                #     "Offload suffix jump: req_id=%s before=%d scheduled=%d "
+                #     "gap_end=%d suffix_end=%d prompt=%d output_placeholders=%d",
+                #     req_id,
+                #     request.num_computed_tokens,
+                #     num_scheduled_token,
+                #     suffix_hit[0],
+                #     suffix_hit[1],
+                #     request.num_tokens,
+                #     request.num_output_placeholders,
+                # )
                 # The loaded suffix contains KV for the prompt, but not the
                 # logits produced by its terminal token. Replay that token so
                 # the worker has a query whose logits can produce token 1.
@@ -1844,14 +1844,14 @@ class Scheduler(SchedulerInterface):
                     suffix_end -= self.num_sampled_tokens_per_step
                     suffix_decode_replay = True
                 request.num_computed_tokens = suffix_end
-                logger.info(
-                    "Offload suffix jump result: req_id=%s computed=%d "
-                    "is_prefill=%s replay_decode=%s",
-                    req_id,
-                    request.num_computed_tokens,
-                    request.num_computed_tokens < request.num_tokens,
-                    suffix_decode_replay,
-                )
+                # logger.info(
+                #     "Offload suffix jump result: req_id=%s computed=%d "
+                #     "is_prefill=%s replay_decode=%s",
+                #     req_id,
+                #     request.num_computed_tokens,
+                #     request.num_computed_tokens < request.num_tokens,
+                #     suffix_decode_replay,
+                # )
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -2398,19 +2398,19 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
                 )
-            if request.request_id in self._suffix_hits or request.num_computed_tokens >= request.num_prompt_tokens - 1:
-                logger.info(
-                    "Output suffix state: req_id=%s status_before=%s status_after=%s "
-                    "computed=%d prompt=%d sampled=%s stopped=%s stale=%s",
-                    req_id,
-                    status_before_stop.name,
-                    request.status.name,
-                    request.num_computed_tokens,
-                    request.num_prompt_tokens,
-                    generated_token_ids,
-                    stopped,
-                    output_is_stale,
-                )
+            # if request.request_id in self._suffix_hits or request.num_computed_tokens >= request.num_prompt_tokens - 1:
+            #     logger.info(
+            #         "Output suffix state: req_id=%s status_before=%s status_after=%s "
+            #         "computed=%d prompt=%d sampled=%s stopped=%s stale=%s",
+            #         req_id,
+            #         status_before_stop.name,
+            #         request.status.name,
+            #         request.num_computed_tokens,
+            #         request.num_prompt_tokens,
+            #         generated_token_ids,
+            #         stopped,
+            #         output_is_stale,
+            #     )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -3425,41 +3425,41 @@ class Scheduler(SchedulerInterface):
             request.num_computed_tokens = 0
             self._suffix_hits[request.request_id] = offload_suffix
             self._offload_suffix_ready.add(request.request_id)
-            if envs.VLLM_KV_CONNECTOR_HIT_LOG:
-                logger.info(
-                    "Offload suffix loaded: req_id=%s suffix_tokens=%d "
-                    "gap_tokens=%d gap=[0, %d) suffix=[%d, %d); "
-                    "will recompute gap then jump",
-                    request.request_id,
-                    suffix_end - gap_end,
-                    gap_end,
-                    gap_end,
-                    gap_end,
-                    suffix_end,
-                )
-            else:
-                logger.debug(
-                    "Request %s: offload suffix loaded [%d, %d); "
-                    "will recompute gap then jump",
-                    request.request_id,
-                    gap_end,
-                    suffix_end,
-                )
+            # if envs.VLLM_KV_CONNECTOR_HIT_LOG:
+            #     logger.info(
+            #         "Offload suffix loaded: req_id=%s suffix_tokens=%d "
+            #         "gap_tokens=%d gap=[0, %d) suffix=[%d, %d); "
+            #         "will recompute gap then jump",
+            #         request.request_id,
+            #         suffix_end - gap_end,
+            #         gap_end,
+            #         gap_end,
+            #         gap_end,
+            #         suffix_end,
+            #     )
+            # else:
+            #     logger.debug(
+            #         "Request %s: offload suffix loaded [%d, %d); "
+            #         "will recompute gap then jump",
+            #         request.request_id,
+            #         gap_end,
+            #         suffix_end,
+            #     )
         else:
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
-        logger.info(
-            "Remote KV completion: req_id=%s failed=%s offload_suffix=%s "
-            "status=%s computed_before_replay=%d blocks=%s",
-            request.request_id,
-            load_failed,
-            offload_suffix,
-            request.status.name,
-            request.num_computed_tokens,
-            self.kv_cache_manager.get_block_ids(request.request_id),
-        )
+        # logger.info(
+        #     "Remote KV completion: req_id=%s failed=%s offload_suffix=%s "
+        #     "status=%s computed_before_replay=%d blocks=%s",
+        #     request.request_id,
+        #     load_failed,
+        #     offload_suffix,
+        #     request.status.name,
+        #     request.num_computed_tokens,
+        #     self.kv_cache_manager.get_block_ids(request.request_id),
+        # )
         if offload_suffix is None:
             # DSV41 SWA bounded replay recomputes the tail of a hit loaded
             # without its window, or of a failed load, which may have lost
