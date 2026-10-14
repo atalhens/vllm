@@ -1817,6 +1817,7 @@ class Scheduler(SchedulerInterface):
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
             suffix_hit = self._suffix_hits.get(req_id)
+            suffix_decode_replay = False
             if suffix_hit is not None and request.num_computed_tokens >= suffix_hit[0]:
                 logger.info(
                     "Offload suffix jump: req_id=%s before=%d scheduled=%d "
@@ -1841,13 +1842,15 @@ class Scheduler(SchedulerInterface):
                     and self.num_sampled_tokens_per_step > 0
                 ):
                     suffix_end -= self.num_sampled_tokens_per_step
+                    suffix_decode_replay = True
                 request.num_computed_tokens = suffix_end
                 logger.info(
                     "Offload suffix jump result: req_id=%s computed=%d "
-                    "is_prefill=%s",
+                    "is_prefill=%s replay_decode=%s",
                     req_id,
                     request.num_computed_tokens,
                     request.num_computed_tokens < request.num_tokens,
+                    suffix_decode_replay,
                 )
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
@@ -1856,6 +1859,13 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            # A terminal prompt-token replay is a decode-classified step even
+            # though its position is one token before the prompt boundary. In
+            # async scheduling this classification is what causes
+            # AsyncScheduler to reserve the output placeholder; without it the
+            # request advances forever with output_placeholders == 0.
+            if suffix_decode_replay:
+                request.is_prefill_chunk = False
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
