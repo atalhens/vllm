@@ -678,17 +678,14 @@ class Scheduler(SchedulerInterface):
 
             if (
                 request.num_output_placeholders > 0
-                # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
-                # Since output placeholders are also included in the computed tokens
-                # count, we subtract (num_output_placeholders - 1) to remove any draft
-                # tokens, so that we can be sure no further steps are needed even if
-                # they are all rejected.
-                and request.num_computed_tokens + 2 - request.num_output_placeholders
-                >= request.num_prompt_tokens + request.max_tokens
+                # Count generated and pending output positions directly. Computed
+                # positions can jump over cached prompt suffixes and are not an
+                # output budget.
+                and request.num_output_tokens + request.num_output_placeholders
+                >= request.max_tokens
             ):
-                # Async scheduling: Avoid scheduling an extra step when we are sure that
-                # the previous step has reached request.max_tokens. We don't schedule
-                # partial draft tokens since this prevents uniform decode optimizations.
+                # Async scheduling: wait for in-flight output rather than scheduling
+                # beyond the request's output budget.
                 req_index += 1
                 continue
 
@@ -2409,6 +2406,29 @@ class Scheduler(SchedulerInterface):
             ec_transfer_params = None
             prefill_stats = None
             status_before_stop = request.status
+            if (
+                not generated_token_ids
+                and not output_is_stale
+                and self.num_sampled_tokens_per_step > 0
+                and request.num_in_flight_tokens == 0
+                and request.num_output_placeholders > 0
+                and request.num_output_tokens + request.num_output_placeholders
+                >= request.max_tokens
+            ):
+                logger.error(
+                    "Request %s exhausted its output budget without producing "
+                    "a sampled token (prompt=%d max_tokens=%d output_tokens=%d "
+                    "placeholders=%d computed=%d).",
+                    req_id,
+                    request.num_prompt_tokens,
+                    request.max_tokens,
+                    request.num_output_tokens,
+                    request.num_output_placeholders,
+                    request.num_computed_tokens,
+                )
+                request.status = RequestStatus.FINISHED_ERROR
+                request.resumable = False
+                stopped = True
 
             # Check for stop and update request status.
             if new_token_ids:
