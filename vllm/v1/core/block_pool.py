@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
+import time
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -12,12 +13,14 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.session_liveness import SessionLivenessTracker
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
@@ -182,6 +185,7 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.session_tracker = SessionLivenessTracker(session_dead_ttl_s=0.0)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -675,6 +679,13 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        queue = self.free_block_queue
+        if isinstance(queue, TieredFreeKVCacheBlockQueue):
+            now = getattr(self, "_time_fn", time.monotonic)()
+            idle_ttl_s = getattr(self, "_suffix_idle_ttl_s", 0.0)
+            if idle_ttl_s > 0:
+                queue.demote_idle(idle_ttl_s, now=now)
+            self.promote_dead_session_blocks(now)
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         if self._reuse_watchers:
@@ -686,12 +697,16 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.freed_at = None
+                block.session_id = None
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.freed_at = None
+                block.session_id = None
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
@@ -799,6 +814,101 @@ class BlockPool:
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
+    def enable_prefix_first_eviction(
+        self,
+        num_tiers: int = 1,
+        idle_ttl_s: float = 0.0,
+        session_dead_ttl_s: float = 0.0,
+        session_ewa_alpha: float = 0.3,
+        session_dead_k: float = 3.0,
+        session_min_gaps: int = 2,
+        session_detector: str = "ewa",
+        session_quantile: float = 0.95,
+        session_gap_window: int = 256,
+    ) -> None:
+        """Enable ordered prefix-pruning tiers before allocating any blocks."""
+        assert not isinstance(self.free_block_queue, TieredFreeKVCacheBlockQueue)
+        free_blocks = self.free_block_queue.get_all_free_blocks()
+        assert len(free_blocks) == self.num_gpu_blocks - 1, (
+            "prefix-first eviction must be enabled before any block is allocated"
+        )
+        for block in free_blocks:
+            block.prev_free_block = block.next_free_block = None
+            block.freed_at = None
+            block.session_id = None
+        self.free_block_queue = TieredFreeKVCacheBlockQueue(free_blocks, num_tiers)
+        self._suffix_idle_ttl_s = idle_ttl_s
+        self.session_tracker = SessionLivenessTracker(
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
+        )
+        if not hasattr(self, "_time_fn"):
+            self._time_fn = time.monotonic
+
+    def promote_dead_session_blocks(self, now: float | None = None) -> int:
+        """Promote cached free blocks owned by sessions predicted to be done."""
+        queue = self.free_block_queue
+        tracker = self.session_tracker
+        if not tracker.enabled or not isinstance(queue, TieredFreeKVCacheBlockQueue):
+            return 0
+        if now is None:
+            now = getattr(self, "_time_fn", time.monotonic)()
+        dead_sessions = tracker.dead_sessions(now)
+        if not dead_sessions:
+            return 0
+        candidates = [
+            block
+            for block in queue.get_all_free_blocks()
+            if block.session_id in dead_sessions and block.block_hash is not None
+        ]
+        for block in candidates:
+            queue.remove(block)
+        queue.prepend_n_to_tier(candidates, 0)
+        return len(candidates)
+
+    def free_blocks_tiered(
+        self,
+        blocks: Sequence[KVCacheBlock],
+        first_tier_len: int,
+        tier_len: int = 0,
+        session_id: str | None = None,
+    ) -> None:
+        """Free blocks into prefix-position eviction tiers."""
+        queue = self.free_block_queue
+        assert isinstance(queue, TieredFreeKVCacheBlockQueue)
+        tiers: list[list[KVCacheBlock]] = [[] for _ in range(queue.num_tiers + 1)]
+        uncached: list[KVCacheBlock] = []
+        now = getattr(self, "_time_fn", time.monotonic)()
+        for idx, block in enumerate(blocks):
+            if block.pool is not None and block.pool is not self:
+                block.pool.free_blocks([block])
+                continue
+            block.ref_cnt -= 1
+            if block.ref_cnt != 0 or block.is_null:
+                continue
+            if block.block_hash is None:
+                uncached.append(block)
+                continue
+            block.freed_at = now
+            block.session_id = session_id
+            if idx < first_tier_len:
+                tiers[0].append(block)
+            elif tier_len > 0:
+                tier = 1 + (idx - first_tier_len) // tier_len
+                tiers[min(tier, queue.num_tiers)].append(block)
+            else:
+                tiers[queue.num_tiers].append(block)
+
+        queue.prepend_n(uncached)
+        for tier, tier_blocks in enumerate(tiers[:-1]):
+            queue.append_n_to_tier(tier_blocks, tier)
+        queue.append_n(tiers[-1])
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 
@@ -847,6 +957,9 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+            block.freed_at = None
+            block.session_id = None
+        self.session_tracker.clear()
 
         if self.metrics_collector:
             self.metrics_collector.reset()

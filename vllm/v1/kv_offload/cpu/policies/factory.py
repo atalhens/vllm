@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import importlib
+import inspect
 from collections.abc import Callable
+from collections.abc import Mapping
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy
@@ -88,3 +91,47 @@ CachePolicyFactory.register_cache_policy(
 CachePolicyFactory.register_cache_policy(
     "arc", "vllm.v1.kv_offload.cpu.policies.arc", "ARCCachePolicy"
 )
+CachePolicyFactory.register_cache_policy(
+    "prefix_pruning_on_sessions",
+    "vllm.v1.kv_offload.cpu.policies.prefix_pruning",
+    "PrefixPruningOnSessionsCachePolicy",
+)
+CachePolicyFactory.register_cache_policy(
+    "prefix_pruning",
+    "vllm.v1.kv_offload.cpu.policies.prefix_pruning",
+    "PrefixPruningCachePolicy",
+)
+
+
+def cache_policy_config_from_extra(extra_config: Mapping[str, Any]) -> dict[str, Any]:
+    nested = extra_config.get("eviction_policy_config")
+    config: dict[str, Any] = dict(nested) if isinstance(nested, dict) else {}
+    for key in (
+        "first_tier_tokens",
+        "tier_step_tokens",
+        "max_tiers",
+        "session_dead_ttl_s",
+        "session_ewa_alpha",
+        "session_dead_k",
+        "session_min_gaps",
+        "session_detector",
+        "session_quantile",
+        "session_gap_window",
+    ):
+        if key in extra_config:
+            config[key] = extra_config[key]
+    return config
+
+
+def instantiate_cache_policy(
+    policy_cls: type[CachePolicy],
+    cache_capacity: int,
+    policy_config: Mapping[str, Any] | None = None,
+) -> CachePolicy:
+    accepted = inspect.signature(policy_cls.__init__).parameters
+    kwargs = {
+        key: value
+        for key, value in (policy_config or {}).items()
+        if key in accepted
+    }
+    return policy_cls(cache_capacity=cache_capacity, **kwargs)

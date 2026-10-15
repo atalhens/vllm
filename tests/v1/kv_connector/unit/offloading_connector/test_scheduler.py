@@ -1540,6 +1540,98 @@ def _maximal_lookup(sched, keys, start_chunk_idx: int = 0):
     )
 
 
+def test_prefix_pruning_lookup_collects_disjoint_full_attention_runs():
+    keys = to_keys([1, 2, 3, 4, 5])
+    results = {
+        1: LookupResult.MISS,
+        2: LookupResult.HIT,
+        3: LookupResult.HIT,
+        4: LookupResult.MISS,
+        5: LookupResult.HIT,
+    }
+    sched = _make_scheduler_with_lookup(results)
+    group = SimpleNamespace(tokens_per_chunk=4, group_idx=0)
+    status = SimpleNamespace(req_context=_EMPTY_REQ_CTX, req=_LOOKUP_REQ)
+
+    spans = sched._find_hit_runs(keys, status, group, 0, max_tokens=20)
+
+    assert spans == [(4, 12), (16, 20)]
+
+
+def test_offload_suffix_hit_can_be_peeked_then_consumed():
+    spans = [(8, 12), (16, 20)]
+    status = SimpleNamespace(hit_spans=list(spans))
+    sched = object.__new__(OffloadingConnectorScheduler)
+    sched._req_status = {"req": status}
+
+    assert sched.peek_suffix_hit("req") == spans
+    assert sched.take_suffix_hit("req") == spans
+    assert sched.peek_suffix_hit("req") is None
+
+
+def test_prefix_pruning_offload_loads_disjoint_suffix_spans():
+    kv_spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    kv_group = KVCacheGroupSpec(["layer"], kv_spec)
+    manager = CPUOffloadingManager(num_chunks=8, cache_policy="prefix_pruning")
+    spec = SimpleNamespace(
+        config=SimpleNamespace(
+            groups=(SimpleNamespace(group_id=0, tokens_per_block=4),)
+        ),
+        tokens_per_block=(4,),
+        tokens_per_hash=4,
+        blocks_per_chunk=1,
+        offload_prompt_only=True,
+        kv_events_config=OffloadingKVEventsConfig(
+            enable_kv_cache_events=False, self_describing_kv_events=False
+        ),
+        get_manager=lambda: manager,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True, prefix_cache_retention_interval=None
+        ),
+        parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),
+    )
+    scheduler = OffloadingConnectorScheduler(
+        spec,
+        vllm_config,
+        KVCacheConfig(num_blocks=32, kv_cache_tensors=[], kv_cache_groups=[kv_group]),
+    )
+    request = MagicMock()
+    request.request_id = "suffix"
+    request.session_id = None
+    request.kv_transfer_params = None
+    request.num_tokens = request.num_prompt_tokens = 24
+    request.block_hashes = [BlockHash(f"block-{i}".encode()) for i in range(6)]
+    request.skip_reading_prefix_cache = False
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    keys = state.group_states[0].offload_keys
+    stored = [keys[idx] for idx in (2, 3, 5)]
+    store = manager.prepare_store(stored, state.req_context)
+    assert store is not None
+    manager.complete_store(store.keys_to_store, state.req_context)
+
+    external_tokens, load_async = scheduler.get_num_new_matched_tokens(request, 0)
+
+    assert external_tokens == 24
+    assert load_async
+    assert scheduler.peek_suffix_hit(request.request_id) == [(8, 16), (20, 24)]
+    dst_blocks = tuple(KVCacheBlock(idx) for idx in range(6))
+    scheduler.update_state_after_alloc(
+        request, KVCacheBlocks((dst_blocks,)), external_tokens
+    )
+    load_job = next(iter(scheduler._current_batch_load_jobs.values()))
+    assert load_job.src_spec.block_ids.tolist() == [
+        manager._policy.get(key).chunk_id for key in stored
+    ]
+    assert load_job.dst_spec.segments == [[(2, 2), (5, 1)]]
+
+
 # Lookups issued, and end index returned, by a window-1 scan over 3 keys all
 # resolving to the same result. A result that keeps the streak alive ends the
 # scan at the first key; one that resets it makes the scan walk every key,

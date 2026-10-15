@@ -90,18 +90,28 @@ TierFilter.ALL = TierFilter(matchers=(TierMatcher(),))
 @dataclass
 class ReqContext:
     req_id: str
+    session_id: str | None = None
     kv_transfer_params: dict[str, Any] | None = None
     load_tier_filter: TierFilter = TierFilter.ALL
     # Per-request scratch space keyed by value type, so a tier can parse
     # kv_transfer_params once (in on_new_request) and read the result back
     # on later calls for the same request.
     _state: dict[type, Any] = field(default_factory=dict, repr=False, init=False)
+    _offload_key_positions: dict[OffloadKey, int] = field(
+        default_factory=dict, repr=False, init=False
+    )
 
     def set_state(self, val: Any) -> None:
         self._state[type(val)] = val
 
     def get_state(self, cls: type[_T]) -> _T | None:
         return self._state.get(cls)
+
+    def set_offload_key_position(self, key: OffloadKey, end_token: int) -> None:
+        self._offload_key_positions[key] = end_token
+
+    def get_offload_key_position(self, key: OffloadKey) -> int | None:
+        return self._offload_key_positions.get(key)
 
 
 class LookupResult(Enum):
@@ -438,12 +448,21 @@ class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
         block_ids: list[int],
         group_sizes: Sequence[int],
         block_indices: Sequence[int],
+        segments: Sequence[Sequence[tuple[int, int]]] | None = None,
     ):
         super().__init__(block_ids)
         assert sum(group_sizes) == len(block_ids)
         assert len(block_indices) == len(group_sizes)
         self.group_sizes: Sequence[int] = group_sizes
         self.block_indices: Sequence[int] = block_indices
+        if segments is None:
+            segments = [
+                [(index, size)] for index, size in zip(block_indices, group_sizes)
+            ]
+        assert len(segments) == len(group_sizes)
+        for size, group_segments in zip(group_sizes, segments):
+            assert sum(count for _, count in group_segments) == size
+        self.segments: Sequence[Sequence[tuple[int, int]]] = segments
 
 
 @dataclass

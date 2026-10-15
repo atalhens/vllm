@@ -165,6 +165,18 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             max_num_new_tokens=self._max_loadable_tokens(request, num_computed_tokens),
         )
 
+    def get_offload_suffix_hit(
+        self, request: "Request"
+    ) -> list[tuple[int, int]] | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.peek_suffix_hit(request.request_id)
+
+    def take_offload_suffix_hit(
+        self, request: "Request"
+    ) -> list[tuple[int, int]] | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.take_suffix_hit(request.request_id)
+
     def _max_loadable_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> int | None:

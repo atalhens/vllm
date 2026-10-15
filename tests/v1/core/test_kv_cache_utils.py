@@ -36,10 +36,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     check_enough_kv_cache_memory,
     estimate_max_model_len,
     generate_block_hash_extra_keys,
@@ -55,6 +57,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     tensor_data,
 )
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.hisparse.layout import (
     create_hisparse_layout,
     get_hisparse_gpu_memory_usage,
@@ -84,12 +87,54 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
     is_full_attention_spec,
     iter_layer_specs,
+    make_block_hash_with_group_id,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_tiered_free_block_queue_orders_and_demotes_idle_blocks():
+    blocks = [KVCacheBlock(idx) for idx in range(1, 5)]
+    queue = TieredFreeKVCacheBlockQueue(blocks, num_tiers=2)
+    queue.popleft_n(4)
+    shallow, deep, tail, idle = blocks
+    deep.freed_at = 0.0
+    idle.freed_at = 0.0
+
+    queue.append_n_to_tier([deep], 1)
+    queue.append_n_to_tier([shallow], 0)
+    queue.append_n([tail, idle])
+
+    assert queue.demote_idle(ttl_s=10.0, now=20.0) == 2
+    assert queue.get_all_free_blocks() == [shallow, deep, idle, tail]
+    assert queue.popleft_n(3) == [shallow, deep, idle]
+
+
+def test_gpu_pool_reuses_dead_session_prefix_before_live_session_prefix():
+    pool = BlockPool(num_gpu_blocks=5, enable_caching=True, hash_block_size=4)
+    pool.enable_prefix_first_eviction(num_tiers=2, session_dead_ttl_s=5.0)
+    pool._time_fn = lambda: 0.0
+    live_block, dead_block, *_ = pool.get_new_blocks(4)
+    live_hash = make_block_hash_with_group_id(BlockHash(b"live"), 0)
+    dead_hash = make_block_hash_with_group_id(BlockHash(b"dead"), 0)
+    pool._insert_block_hash(live_hash, live_block, num_tokens=4)
+    pool._insert_block_hash(dead_hash, dead_block, num_tokens=4)
+    pool.session_tracker.on_arrival("finished-session", now=0.0)
+    pool.session_tracker.on_finish("finished-session", now=0.0)
+    pool.free_blocks_tiered([live_block], first_tier_len=1, session_id="active-session")
+    pool.free_blocks_tiered(
+        [dead_block], first_tier_len=0, tier_len=1, session_id="finished-session"
+    )
+
+    pool._time_fn = lambda: 10.0
+    assert pool.get_new_blocks(1) == [dead_block]
+    assert pool.cached_block_hash_to_block.get_one_block(dead_hash) is None
+    assert pool.cached_block_hash_to_block.get_one_block(live_hash) is live_block
+
+    assert pool.get_new_blocks(1) == [live_block]
 
 
 @pytest.mark.parametrize("gpu_block_size", [32, 64])

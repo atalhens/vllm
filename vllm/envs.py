@@ -97,6 +97,19 @@ if TYPE_CHECKING:
     VLLM_USE_PRECOMPILED: bool = False
     VLLM_USE_PRECOMPILED_RUST: bool = False
     VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX: bool = False
+    VLLM_SUFFIX_PRESERVING_EVICTION: bool = False
+    VLLM_SUFFIX_EVICTION_PREFIX_FRACTION: float = 0.5
+    VLLM_SUFFIX_EVICTION_TIER_TOKENS: int = 0
+    VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS: int = 0
+    VLLM_SUFFIX_EVICTION_MAX_TIERS: int = 0
+    VLLM_SUFFIX_EVICTION_IDLE_TTL_S: float = 0.0
+    VLLM_SUFFIX_SESSION_DEAD_TTL_S: float = 0.0
+    VLLM_SUFFIX_SESSION_EWA_ALPHA: float = 0.3
+    VLLM_SUFFIX_SESSION_DEAD_K: float = 3.0
+    VLLM_SUFFIX_SESSION_MIN_GAPS: int = 2
+    VLLM_SUFFIX_SESSION_DETECTOR: str = "ewa"
+    VLLM_SUFFIX_SESSION_QUANTILE: float = 0.95
+    VLLM_SUFFIX_SESSION_GAP_WINDOW: int = 256
     VLLM_DOCKER_BUILD_CONTEXT: bool = False
     VLLM_BUILD_COMMIT: str = "unknown"
     VLLM_BUILD_PIPELINE: str = "local"
@@ -598,6 +611,45 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_SUFFIX_PRESERVING_EVICTION": lambda: bool(
+        int(os.getenv("VLLM_SUFFIX_PRESERVING_EVICTION", "0"))
+    ),
+    "VLLM_SUFFIX_EVICTION_PREFIX_FRACTION": lambda: float(
+        os.getenv("VLLM_SUFFIX_EVICTION_PREFIX_FRACTION", "0.5")
+    ),
+    "VLLM_SUFFIX_EVICTION_TIER_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_TIER_TOKENS", "0")
+    ),
+    "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS", "0")
+    ),
+    "VLLM_SUFFIX_EVICTION_MAX_TIERS": lambda: int(
+        os.getenv("VLLM_SUFFIX_EVICTION_MAX_TIERS", "0")
+    ),
+    "VLLM_SUFFIX_EVICTION_IDLE_TTL_S": lambda: float(
+        os.getenv("VLLM_SUFFIX_EVICTION_IDLE_TTL_S", "0")
+    ),
+    "VLLM_SUFFIX_SESSION_DEAD_TTL_S": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_DEAD_TTL_S", "0")
+    ),
+    "VLLM_SUFFIX_SESSION_EWA_ALPHA": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_EWA_ALPHA", "0.3")
+    ),
+    "VLLM_SUFFIX_SESSION_DEAD_K": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_DEAD_K", "3")
+    ),
+    "VLLM_SUFFIX_SESSION_MIN_GAPS": lambda: int(
+        os.getenv("VLLM_SUFFIX_SESSION_MIN_GAPS", "2")
+    ),
+    "VLLM_SUFFIX_SESSION_DETECTOR": lambda: os.getenv(
+        "VLLM_SUFFIX_SESSION_DETECTOR", "ewa"
+    ),
+    "VLLM_SUFFIX_SESSION_QUANTILE": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_QUANTILE", "0.95")
+    ),
+    "VLLM_SUFFIX_SESSION_GAP_WINDOW": lambda: int(
+        os.getenv("VLLM_SUFFIX_SESSION_GAP_WINDOW", "256")
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

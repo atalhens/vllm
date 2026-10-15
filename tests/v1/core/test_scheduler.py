@@ -170,6 +170,22 @@ def test_routed_experts_prompt_start_at_prompt_end():
     assert outputs[request.client_index].outputs[0].routed_experts.shape == (0, 1, 1)
 
 
+def test_scheduler_jumps_over_cached_suffix_spans():
+    scheduler = object.__new__(Scheduler)
+    scheduler._suffix_hits = {"req": [(4, 8), (12, 16)]}
+    scheduler._offload_suffix_ready = set()
+    request = SimpleNamespace(request_id="req", num_computed_tokens=4)
+
+    assert scheduler._advance_past_cached_suffix(request) == 12
+    assert request.num_computed_tokens == 8
+    assert scheduler._suffix_hits["req"] == [(12, 16)]
+
+    request.num_computed_tokens = 12
+    assert scheduler._advance_past_cached_suffix(request) is None
+    assert request.num_computed_tokens == 16
+    assert "req" not in scheduler._suffix_hits
+
+
 def test_finish_request():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)

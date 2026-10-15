@@ -336,21 +336,33 @@ class SingleDirectionOffloadingHandler:
         # list of pinned descriptor buffer sets available for re-use
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    def _estimate_max_copy_ops(self, group_sizes: Sequence[int]) -> int:
+    def _estimate_max_copy_ops(
+        self, segments: Sequence[Sequence[tuple[int, int]]]
+    ) -> int:
         """Upper bound on the number of copy descriptors for a transfer.
 
         Exact for the direct layout. The canonical path may fill fewer:
         writer rotation later drops the blocks this rank does not write."""
         num_copy_ops = 0
-        for g_idx, (group_size, layer_refs) in enumerate(
-            zip(group_sizes, self.layer_refs_per_group)
+        for g_idx, (group_segments, layer_refs) in enumerate(
+            zip(segments, self.layer_refs_per_group)
         ):
-            if self._canonical_copy_plans is None:
-                num_copy_ops += group_size * len(layer_refs)
-            else:
-                num_copy_ops += group_size * sum(
-                    plan.num_frags for plan in self._canonical_copy_plans[g_idx]
+            for block_idx, group_size in group_segments:
+                source_blocks = cdiv(
+                    group_size + block_idx % self.src_blocks_per_chunk,
+                    self.src_blocks_per_chunk,
                 )
+                destination_blocks = cdiv(
+                    group_size + block_idx % self.dst_blocks_per_chunk,
+                    self.dst_blocks_per_chunk,
+                )
+                num_blocks = max(source_blocks, destination_blocks)
+                if self._canonical_copy_plans is None:
+                    num_copy_ops += num_blocks * len(layer_refs)
+                else:
+                    num_copy_ops += num_blocks * sum(
+                        plan.num_frags for plan in self._canonical_copy_plans[g_idx]
+                    )
         return num_copy_ops
 
     def _fill_direct_ops(
@@ -548,11 +560,10 @@ class SingleDirectionOffloadingHandler:
         group_sizes = gpu_spec.group_sizes
         assert len(group_sizes) == len(self.layer_refs_per_group)
 
-        # extract block indices from the GPU spec
-        block_indices = gpu_spec.block_indices
-        assert len(block_indices) == len(self.layer_refs_per_group)
+        segments = gpu_spec.segments
+        assert len(segments) == len(self.layer_refs_per_group)
 
-        num_copy_ops = self._estimate_max_copy_ops(group_sizes)
+        num_copy_ops = self._estimate_max_copy_ops(segments)
 
         # reuse a pooled buffer set, growing it if this transfer needs more room
         batch_src, batch_dst, batch_sizes = (
@@ -575,41 +586,37 @@ class SingleDirectionOffloadingHandler:
         op_idx = 0
         # count total number of bytes copied
         num_transfer_bytes = 0
-        for g_idx, (group_size, block_idx) in enumerate(
-            zip(group_sizes, block_indices)
-        ):
-            if group_size == 0:
-                continue
+        for g_idx, group_segments in enumerate(segments):
+            for block_idx, group_size in group_segments:
+                if group_size == 0:
+                    continue
 
-            src_logical_blocks_to_skip = block_idx % self.src_blocks_per_chunk
-            dst_logical_blocks_to_skip = block_idx % self.dst_blocks_per_chunk
-            src_logical_blocks_count = group_size + src_logical_blocks_to_skip
-            dst_logical_blocks_count = group_size + dst_logical_blocks_to_skip
+                src_skip = block_idx % self.src_blocks_per_chunk
+                dst_skip = block_idx % self.dst_blocks_per_chunk
+                src_end_offset = src_offset + cdiv(
+                    group_size + src_skip, self.src_blocks_per_chunk
+                )
+                dst_end_offset = dst_offset + cdiv(
+                    group_size + dst_skip, self.dst_blocks_per_chunk
+                )
+                assert src_end_offset <= num_src_blocks
+                assert dst_end_offset <= num_dst_blocks
 
-            dst_blocks_count = cdiv(dst_logical_blocks_count, self.dst_blocks_per_chunk)
-            dst_end_offset = dst_offset + dst_blocks_count
-            assert dst_end_offset <= num_dst_blocks
-
-            src_blocks_count = cdiv(src_logical_blocks_count, self.src_blocks_per_chunk)
-            src_end_offset = src_offset + src_blocks_count
-            assert src_end_offset <= num_src_blocks
-
-            op_idx, group_bytes = self._fill_group_ops(
-                g_idx,
-                group_src=src_blocks[src_offset:src_end_offset],
-                group_dst=dst_blocks[dst_offset:dst_end_offset],
-                group_size=group_size,
-                src_skip_count=src_logical_blocks_to_skip,
-                dst_skip_count=dst_logical_blocks_to_skip,
-                all_src=all_src,
-                all_dst=all_dst,
-                all_sizes=all_sizes,
-                op_idx=op_idx,
-            )
-            num_transfer_bytes += group_bytes
-
-            src_offset = src_end_offset
-            dst_offset = dst_end_offset
+                op_idx, group_bytes = self._fill_group_ops(
+                    g_idx,
+                    group_src=src_blocks[src_offset:src_end_offset],
+                    group_dst=dst_blocks[dst_offset:dst_end_offset],
+                    group_size=group_size,
+                    src_skip_count=src_skip,
+                    dst_skip_count=dst_skip,
+                    all_src=all_src,
+                    all_dst=all_dst,
+                    all_sizes=all_sizes,
+                    op_idx=op_idx,
+                )
+                num_transfer_bytes += group_bytes
+                src_offset = src_end_offset
+                dst_offset = dst_end_offset
 
         assert src_offset == num_src_blocks
         assert dst_offset == num_dst_blocks

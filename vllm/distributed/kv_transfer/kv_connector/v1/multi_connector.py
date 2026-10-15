@@ -429,6 +429,26 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 to_return = (toks, load_async)
         return to_return
 
+    def get_offload_suffix_hit(
+        self, request: "Request"
+    ) -> list[tuple[int, int]] | None:
+        connector_idx = self._requests_to_connector.get(request.request_id)
+        if connector_idx is None:
+            return None
+        getter = getattr(self._connectors[connector_idx], "get_offload_suffix_hit", None)
+        return getter(request) if getter is not None else None
+
+    def take_offload_suffix_hit(
+        self, request: "Request"
+    ) -> list[tuple[int, int]] | None:
+        connector_idx = self._requests_to_connector.get(request.request_id)
+        if connector_idx is None:
+            return None
+        taker = getattr(
+            self._connectors[connector_idx], "take_offload_suffix_hit", None
+        )
+        return taker(request) if taker is not None else None
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

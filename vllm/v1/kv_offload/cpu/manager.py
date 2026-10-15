@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
+from typing import Any
 
 from typing_extensions import override
 
@@ -24,7 +25,10 @@ from vllm.v1.kv_offload.cpu.common import (
     CPUOffloadingMetrics,
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
-from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+from vllm.v1.kv_offload.cpu.policies.factory import (
+    CachePolicyFactory,
+    instantiate_cache_policy,
+)
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -47,6 +51,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        cache_policy_config: Mapping[str, Any] | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
@@ -56,7 +61,9 @@ class CPUOffloadingManager(OffloadingManager):
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+        self._policy: CachePolicy = instantiate_cache_policy(
+            policy_cls, num_chunks, cache_policy_config
+        )
         # Track the number of chunks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
@@ -71,6 +78,10 @@ class CPUOffloadingManager(OffloadingManager):
         self.counts: OrderedDict[OffloadKey, int] | None = (
             OrderedDict() if store_threshold >= 2 else None
         )
+
+    @property
+    def supports_suffix_pruning(self) -> bool:
+        return bool(getattr(self._policy, "supports_suffix_pruning", False))
 
     # --- chunk pool ---
 
@@ -128,6 +139,7 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        self._policy.on_new_request(req_context)
         return RequestOffloadingContext()
 
     @override
@@ -283,6 +295,11 @@ class CPUOffloadingManager(OffloadingManager):
                     removed=False,
                 )
             )
+        self._policy.on_chunks_stored(stored_keys, req_context)
+
+    @override
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        self._policy.on_request_finished(req_context)
 
     @override
     def reset_cache(self) -> None:

@@ -21,6 +21,7 @@ from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.policies.factory import cache_policy_config_from_extra
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
@@ -156,6 +157,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                cache_policy_config=cache_policy_config_from_extra(
+                    self.extra_config
+                ),
             )
         return self._manager
 

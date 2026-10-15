@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -198,6 +199,9 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # Metadata used by suffix-preserving and session-aware GPU eviction.
+    freed_at: float | None = None
+    session_id: str | None = None
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -487,6 +491,124 @@ class FreeKVCacheBlockQueue:
         while curr_block is not None and curr_block is not self.fake_free_list_tail:
             yield curr_block
             curr_block = curr_block.next_free_block
+
+
+_TIER_BOUNDARY_BLOCK_ID = -2
+
+
+class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
+    """Free-block queue with ordered evict-first tiers followed by an LRU tail."""
+
+    def __init__(self, blocks: list[KVCacheBlock], num_tiers: int = 1) -> None:
+        assert num_tiers >= 1
+        super().__init__(blocks)
+        self._boundaries = [
+            KVCacheBlock(block_id=_TIER_BOUNDARY_BLOCK_ID) for _ in range(num_tiers)
+        ]
+        prev_block = self.fake_free_list_tail.prev_free_block
+        assert prev_block is not None
+        for boundary in self._boundaries:
+            prev_block.next_free_block = boundary
+            boundary.prev_free_block = prev_block
+            prev_block = boundary
+        prev_block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = prev_block
+
+    @property
+    def num_tiers(self) -> int:
+        return len(self._boundaries)
+
+    def popleft(self) -> KVCacheBlock:
+        if self.num_free_blocks == 0:
+            raise ValueError("No free blocks available")
+        return self.popleft_n(1)[0]
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        self.num_free_blocks -= n
+
+        passed_boundaries: list[KVCacheBlock] = []
+        curr_block = self.fake_free_list_head.next_free_block
+        ret = []
+        while len(ret) < n:
+            assert curr_block is not None
+            if curr_block.block_id == _TIER_BOUNDARY_BLOCK_ID:
+                passed_boundaries.append(curr_block)
+                curr_block = curr_block.next_free_block
+                continue
+            ret.append(curr_block)
+            next_block = curr_block.next_free_block
+            curr_block.prev_free_block = None
+            curr_block.next_free_block = None
+            curr_block = next_block
+
+        assert curr_block is not None
+        prev_block = self.fake_free_list_head
+        for block in [*passed_boundaries, curr_block]:
+            prev_block.next_free_block = block
+            block.prev_free_block = prev_block
+            prev_block = block
+        return ret
+
+    def append_n_to_tier(self, blocks: list[KVCacheBlock], tier: int) -> None:
+        if not blocks:
+            return
+        boundary = self._boundaries[tier]
+        prev_block = boundary.prev_free_block
+        assert prev_block is not None
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+        prev_block.next_free_block = boundary
+        boundary.prev_free_block = prev_block
+        self.num_free_blocks += len(blocks)
+
+    def prepend_n_to_tier(self, blocks: list[KVCacheBlock], tier: int) -> None:
+        if not blocks:
+            return
+        anchor = self.fake_free_list_head if tier == 0 else self._boundaries[tier - 1]
+        first = anchor.next_free_block
+        assert first is not None
+        previous = anchor
+        for block in blocks:
+            block.prev_free_block = previous
+            previous.next_free_block = block
+            previous = block
+        previous.next_free_block = first
+        first.prev_free_block = previous
+        self.num_free_blocks += len(blocks)
+
+    def demote_idle(self, ttl_s: float, now: float | None = None) -> int:
+        if ttl_s <= 0:
+            return 0
+        now = time.monotonic() if now is None else now
+        expired = [
+            block
+            for block in self.get_all_free_blocks()
+            if block.freed_at is not None and now - block.freed_at >= ttl_s
+        ]
+        for block in expired:
+            self.remove(block)
+        self.append_n_to_tier(expired, 0)
+        return len(expired)
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        return [
+            block
+            for block in super().get_all_free_blocks()
+            if block.block_id != _TIER_BOUNDARY_BLOCK_ID
+        ]
+
+    def iter_blocks_after(
+        self,
+        cursor: KVCacheBlock | None,
+    ) -> Iterator[KVCacheBlock]:
+        for block in super().iter_blocks_after(cursor):
+            if block.block_id != _TIER_BOUNDARY_BLOCK_ID:
+                yield block
 
 
 def _gen_mm_extra_hash_keys(

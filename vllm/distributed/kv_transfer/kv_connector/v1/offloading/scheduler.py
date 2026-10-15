@@ -367,6 +367,7 @@ class RequestOffloadState:
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
+    hit_spans: list[tuple[int, int]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
 
@@ -394,6 +395,7 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            start_idx = len(group_state.offload_keys)
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -404,6 +406,11 @@ class RequestOffloadState:
             ):
                 group_state.offload_keys.append(
                     make_offload_key(req_block_hash, group_config.group_idx)
+                )
+            for chunk_idx in range(start_idx, len(group_state.offload_keys)):
+                self.req_context.set_offload_key_position(
+                    group_state.offload_keys[chunk_idx],
+                    (chunk_idx + 1) * group_config.tokens_per_chunk,
                 )
 
     def update_block_id_groups(
@@ -524,6 +531,7 @@ def _create_req_context(req: Request) -> ReqContext:
             load_filter = _parse_tier_filter(raw)
     return ReqContext(
         req_id=req.request_id,
+        session_id=getattr(req, "session_id", None),
         kv_transfer_params=params,
         load_tier_filter=load_filter,
     )
@@ -673,6 +681,62 @@ class OffloadingConnectorScheduler:
                     break
         return hit_count if not defer_lookup else None
 
+    def _find_hit_runs(
+        self,
+        keys: Sequence[OffloadKey],
+        req_status: RequestOffloadState,
+        group_config: GroupOffloadConfig,
+        start_chunk_idx: int,
+        max_tokens: int,
+    ) -> list[tuple[int, int]] | None:
+        """Find all cached runs for a single full-attention cache group."""
+        runs: list[tuple[int, int]] = []
+        run_start: int | None = None
+        run_length = 0
+        defer_lookup = False
+        for local_idx, key in enumerate(keys):
+            result = self.manager.lookup(key, req_status.req_context)
+            if result in (LookupResult.HIT, LookupResult.HIT_PENDING):
+                self._events_tracker.record_lookup(
+                    req_status.req,
+                    group_config,
+                    start_chunk_idx + local_idx,
+                    key,
+                )
+                if result is LookupResult.HIT_PENDING:
+                    defer_lookup = True
+                if run_start is None:
+                    run_start = local_idx
+                run_length += 1
+            elif result is LookupResult.RETRY:
+                defer_lookup = True
+                if run_start is not None:
+                    runs.append((run_start, run_length))
+                    run_start = None
+                    run_length = 0
+            elif run_start is not None:
+                runs.append((run_start, run_length))
+                run_start = None
+                run_length = 0
+        if run_start is not None:
+            runs.append((run_start, run_length))
+        if defer_lookup:
+            return None
+
+        tokens_per_chunk = group_config.tokens_per_chunk
+        spans = [
+            (
+                (start_chunk_idx + start) * tokens_per_chunk,
+                min(
+                    max_tokens,
+                    (start_chunk_idx + start + length) * tokens_per_chunk,
+                ),
+            )
+            for start, length in runs
+        ]
+        spans = [(start, end) for start, end in spans if end > start]
+        return spans
+
     def _sliding_window_lookup(
         self,
         keys: Sequence[OffloadKey],
@@ -781,6 +845,7 @@ class OffloadingConnectorScheduler:
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
+        req_status.hit_spans.clear()
 
         # Tracks which eagle groups have already popped their volatile trailing chunk
         # in the current convergence iteration. Reset when a non-eagle group
@@ -834,6 +899,46 @@ class OffloadingConnectorScheduler:
                 num_chunks = min(cdiv(query_max, tokens_per_chunk), len(offload_keys))
                 start_chunk_idx = num_computed_tokens // tokens_per_chunk
                 offload_keys = offload_keys[start_chunk_idx:num_chunks]
+
+                if (
+                    getattr(self.manager, "supports_suffix_pruning", False)
+                    and len(self.config.kv_group_configs) == 1
+                    and sliding_window_size_in_chunks is None
+                    and not is_eagle_unverified
+                ):
+                    spans = self._find_hit_runs(
+                        offload_keys,
+                        req_status,
+                        group_config,
+                        start_chunk_idx,
+                        max_hit_size_tokens,
+                    )
+                    if spans is None:
+                        defer_lookup = True
+                        continue
+                    if spans:
+                        prefix_has_gap = spans[0][0] > num_computed_tokens
+                        internal_gap = any(
+                            left_end < right_start
+                            for (_, left_end), (right_start, _) in zip(
+                                spans, spans[1:]
+                            )
+                        )
+                        if prefix_has_gap or internal_gap:
+                            req_status.hit_spans = spans
+                            num_hit_tokens = spans[-1][1] - num_computed_tokens
+                            lookup_groups = ()
+                            break
+                        num_hit_chunks = (
+                            spans[0][1] - num_computed_tokens
+                        ) // tokens_per_chunk
+                        max_hit_size_tokens = min(
+                            max_hit_size_tokens,
+                            num_computed_tokens
+                            + num_hit_chunks * tokens_per_chunk,
+                        )
+                        num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+                        continue
 
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
@@ -955,6 +1060,8 @@ class OffloadingConnectorScheduler:
     ) -> int | None:
         complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
         req_status.partial_tail_boundary = None
+        if req_status.hit_spans:
+            return complete_hit
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
 
@@ -1073,6 +1180,20 @@ class OffloadingConnectorScheduler:
 
         return num_hit_tokens, bool(num_hit_tokens)
 
+    def take_suffix_hit(self, request_id: str) -> list[tuple[int, int]] | None:
+        req_status = self._req_status.get(request_id)
+        if req_status is None or not req_status.hit_spans:
+            return None
+        spans = list(req_status.hit_spans)
+        req_status.hit_spans.clear()
+        return spans
+
+    def peek_suffix_hit(self, request_id: str) -> list[tuple[int, int]] | None:
+        req_status = self._req_status.get(request_id)
+        if req_status is None or not req_status.hit_spans:
+            return None
+        return list(req_status.hit_spans)
+
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
@@ -1082,7 +1203,12 @@ class OffloadingConnectorScheduler:
         req_status = self._req_status[request.request_id]
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
-        num_cached_tokens = num_locally_computed_tokens + num_external_tokens
+        hit_spans = req_status.hit_spans
+        num_cached_tokens = (
+            hit_spans[-1][1]
+            if hit_spans
+            else num_locally_computed_tokens + num_external_tokens
+        )
         partial_tail_boundary = req_status.partial_tail_boundary
         if partial_tail_boundary is not None:
             assert partial_tail_boundary == num_cached_tokens
@@ -1092,6 +1218,7 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
+        group_segments: list[list[tuple[int, int]]] = []
         for group_config, group_state in zip(
             self.config.kv_group_configs,
             req_status.group_states,
@@ -1107,6 +1234,25 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
+            if hit_spans:
+                segments: list[tuple[int, int]] = []
+                for span_start, span_end in hit_spans:
+                    assert span_start % tokens_per_block == 0
+                    assert span_end % tokens_per_block == 0
+                    start_block = span_start // tokens_per_block
+                    block_count = (span_end - span_start) // tokens_per_block
+                    start_chunk = span_start // tokens_per_chunk
+                    chunk_count = (span_end - span_start) // tokens_per_chunk
+                    keys_to_load.extend(offload_keys[start_chunk : start_chunk + chunk_count])
+                    dst_block_ids.extend(
+                        block.block_id
+                        for block in group_blocks[start_block : start_block + block_count]
+                    )
+                    segments.append((start_block, block_count))
+                group_sizes.append(sum(count for _, count in segments))
+                block_indices.append(segments[0][0] if segments else 0)
+                group_segments.append(segments)
+                continue
             # ``load_start_gpu_block_idx``: the index in ``group_blocks`` where the
             # load region begins -- a slice bound, not a count of computed blocks.
             # Scan from the computed boundary, not 0: sparse groups (Mamba,
@@ -1154,6 +1300,7 @@ class OffloadingConnectorScheduler:
             )
             group_sizes.append(num_pending_gpu_blocks)
             block_indices.append(load_start_gpu_block_idx)
+            group_segments.append([(load_start_gpu_block_idx, num_pending_gpu_blocks)])
 
             # Skip prefix-hit chunks for block-level policy; for
             # request-level, next_stored_chunk_idx stays at 0 so all
@@ -1163,7 +1310,10 @@ class OffloadingConnectorScheduler:
 
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
-            dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
+            dst_block_ids,
+            group_sizes=group_sizes,
+            block_indices=block_indices,
+            segments=group_segments,
         )
 
         load_job_id = self._generate_job_id()

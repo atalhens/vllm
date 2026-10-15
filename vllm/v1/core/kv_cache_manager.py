@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -11,11 +12,16 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
+    UnitaryKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+    SingleTypeKVCacheManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -225,6 +231,113 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        self._suffix_hit_manager: FullAttentionManager | None = None
+
+    def enable_suffix_preserving_eviction(
+        self,
+        prefix_evict_fraction: float = 0.5,
+        first_tier_tokens: int = 0,
+        tier_tokens: int = 0,
+        max_tiers: int = 0,
+        idle_ttl_s: float = 0.0,
+        session_dead_ttl_s: float = 0.0,
+        session_ewa_alpha: float = 0.3,
+        session_dead_k: float = 3.0,
+        session_min_gaps: int = 2,
+        session_detector: str = "ewa",
+        session_quantile: float = 0.95,
+        session_gap_window: int = 256,
+    ) -> None:
+        manager = self.coordinator.single_type_managers[0]
+        if (
+            not self.enable_caching
+            or not isinstance(self.coordinator, UnitaryKVCacheCoordinator)
+            or type(manager) is not FullAttentionManager
+        ):
+            raise ValueError(
+                "Suffix-preserving eviction requires prefix caching and a "
+                "single full-attention KV cache group."
+            )
+        block_size = manager.block_size
+        first_tier_len = first_tier_tokens // block_size
+        tier_len = (tier_tokens or first_tier_tokens) // block_size
+        if first_tier_tokens and (first_tier_len == 0 or tier_len == 0):
+            raise ValueError(
+                f"Suffix eviction tier sizes must be at least one block "
+                f"({block_size} tokens)."
+            )
+        if max_tiers < 0 or idle_ttl_s < 0 or session_dead_ttl_s < 0:
+            raise ValueError("eviction tier limits and TTLs must not be negative")
+        num_tiers = 1
+        if first_tier_len:
+            max_num_blocks = cdiv(self.max_model_len, block_size)
+            full_tiers = 1 + max(0, cdiv(max_num_blocks - first_tier_len, tier_len))
+            num_tiers = min(full_tiers, max_tiers) if max_tiers > 0 else full_tiers
+        self.block_pool.enable_prefix_first_eviction(
+            num_tiers,
+            idle_ttl_s,
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
+        )
+        manager.enable_suffix_preserving_eviction(
+            prefix_evict_fraction, first_tier_len, tier_len if first_tier_len else 0
+        )
+        self._suffix_hit_manager = manager
+
+    def note_session_arrival(self, request: Request) -> None:
+        tracker = self.block_pool.session_tracker
+        if tracker.enabled:
+            now = getattr(self.block_pool, "_time_fn", time.monotonic)()
+            tracker.on_arrival(request.session_id, now)
+
+    def get_suffix_hit(
+        self, computed_blocks: KVCacheBlocks, num_prefix_hit_tokens: int
+    ) -> tuple[int, int] | None:
+        if self._suffix_hit_manager is None:
+            return None
+        blocks = computed_blocks.blocks[0]
+        block_size = self._suffix_hit_manager.block_size
+        gap_end = num_prefix_hit_tokens // block_size
+        if len(blocks) <= gap_end:
+            return None
+        while gap_end < len(blocks) and blocks[gap_end].is_null:
+            gap_end += 1
+        if gap_end == len(blocks):
+            return None
+        return gap_end * block_size, len(blocks) * block_size
+
+    def register_offload_suffix_hit(
+        self, request: Request, spans: list[tuple[int, int]]
+    ) -> None:
+        if not self.enable_caching or not spans:
+            return
+        manager = self.coordinator.single_type_managers[0]
+        if type(manager) is not FullAttentionManager:
+            return
+        block_size = manager.block_size
+        req_id = request.request_id
+        boundaries = self.coordinator.get_replay_boundaries(request)
+        block_spans = []
+        for span_start, span_end in spans:
+            assert span_start % block_size == 0 and span_end % block_size == 0
+            start_block = span_start // block_size
+            end_block = span_end // block_size
+            block_spans.append((start_block, end_block))
+            manager.num_cached_block[req_id] = start_block
+            SingleTypeKVCacheManager.cache_blocks(
+                manager,
+                request,
+                span_end,
+                retention_interval=self.coordinator.retention_interval,
+                replay_boundaries=boundaries,
+            )
+        manager.num_cached_block[req_id] = 0
+        manager._suffix_hit_reqs[req_id] = block_spans
 
     @property
     def usage(self) -> float:
@@ -298,6 +411,20 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if self._suffix_hit_manager is not None and not request.mm_features:
+            suffix_hit = self._suffix_hit_manager.find_suffix_hit(
+                request.block_hashes,
+                len(computed_blocks[0]),
+                max_cache_hit_length,
+            )
+            if suffix_hit is not None:
+                suffix_start, suffix_blocks = suffix_hit
+                gap_blocks = suffix_start - len(computed_blocks[0])
+                computed_blocks = (
+                    list(computed_blocks[0])
+                    + [self.block_pool.null_block] * gap_blocks
+                    + suffix_blocks,
+                )
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -600,7 +727,7 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
-    def free(self, request: Request) -> None:
+    def free(self, request: Request, session_finished: bool = True) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
         first when caching is enabled.
@@ -608,7 +735,30 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        if session_finished:
+            self.record_session_finish(request)
+        if self._suffix_hit_manager is not None:
+            self.coordinator.free(request.request_id, session_id=request.session_id)
+        else:
+            self.coordinator.free(request.request_id)
+
+    def record_session_finish(self, request: Request) -> None:
+        tracker = self.block_pool.session_tracker
+        now = getattr(self.block_pool, "_time_fn", time.monotonic)()
+        tracker.on_finish(request.session_id, now)
+
+    def free_deferred_blocks(
+        self, blocks: list[KVCacheBlock], session_id: str | None
+    ) -> None:
+        """Return deferred request blocks while preserving GPU eviction tiers."""
+        if self._suffix_hit_manager is None:
+            self.block_pool.free_blocks(reversed(blocks))
+            return
+        self._suffix_hit_manager.free_blocks(blocks, session_id)
+
+    @property
+    def suffix_preserving_eviction_enabled(self) -> bool:
+        return self._suffix_hit_manager is not None
 
     def remove_skipped_blocks(
         self,

@@ -96,3 +96,17 @@ class CachePolicy(ABC):
     def mark_non_evictable(self, key: OffloadKey) -> None:
         """Called when a chunk's ref_cnt transitions from 0."""
         return
+
+    def on_new_request(self, req_context: ReqContext) -> None:
+        """Observe request arrival; policies may use this for session state."""
+        return
+
+    def on_chunks_stored(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Observe successful stores without changing other policies' recency."""
+        return
+
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        """Observe request completion; policies may use this for session state."""
+        return
