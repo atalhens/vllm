@@ -124,9 +124,9 @@ class RequestState:
         self.num_computed_tokens.apply_write()
 
     def sync_prefill_num_computed_tokens(self, req_ids: list[str]) -> None:
-        # Suffix-preserving eviction lets the scheduler advance a prefilling
-        # request past a cached suffix. The GPU value only advances by the query
-        # length, so overwrite it with the scheduler's (exact during prefill).
+        # The scheduler can advance past cached suffixes without computing them.
+        # Keep the runner's cursor aligned so prefill sampling and positions use
+        # the same sequence position as the scheduler.
         for req_id in req_ids:
             req_idx = self.req_id_to_index[req_id]
             num_computed = int(self.num_computed_tokens_np[req_idx])

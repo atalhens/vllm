@@ -13,7 +13,9 @@ from vllm.v1.request import RequestStatus
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_prefix_pruning_reload_loads_suffix(request_runner, async_scheduling):
+def test_prefix_pruning_reload_loads_suffix(
+    request_runner, async_scheduling, monkeypatch
+):
     block_size = 4
     tokens_per_chunk = block_size  # blocks_per_chunk = 1
     num_gpu_blocks = 100
@@ -42,12 +44,22 @@ def test_prefix_pruning_reload_loads_suffix(request_runner, async_scheduling):
         generate_store_output([])
     )
 
+    scheduled_outputs = []
+    schedule = runner.scheduler.schedule
+
+    def capture_schedule_output(*args, **kwargs):
+        output = schedule(*args, **kwargs)
+        scheduled_outputs.append(output)
+        return output
+
+    monkeypatch.setattr(runner.scheduler, "schedule", capture_schedule_output)
     runner.new_request(token_ids=[0] * tokens_per_chunk * 5)
     # CDE (chunks 2,3,4) loaded from storage; AB (0,1) recomputed.
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         expected_loaded=(2, 3, 4),
     )
+    assert any(output.prefill_cursor_sync_req_ids for output in scheduled_outputs)
 
 
 def test_async_suffix_reload_stops_when_decode_output_is_missing(

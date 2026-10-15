@@ -314,6 +314,10 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Requests whose prefill cursor jumped over a cached offload suffix and
+    # must be synchronized in the model runner before the next forward pass.
+    prefill_cursor_sync_req_ids: list[str] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

@@ -355,6 +355,7 @@ class Scheduler(SchedulerInterface):
         # Requests whose offload suffix has been loaded into already-allocated
         # blocks; the next WAITING schedule recomputes the gap then jumps.
         self._offload_suffix_ready: set[str] = set()
+        self._prefill_cursor_sync_req_ids: set[str] = set()
         if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
             self._enable_suffix_preserving_eviction()
 
@@ -1676,7 +1677,13 @@ class Scheduler(SchedulerInterface):
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            prefill_cursor_sync_req_ids=sorted(
+                self._prefill_cursor_sync_req_ids.intersection(
+                    cached_reqs_data.req_ids
+                )
+            ),
         )
+        self._prefill_cursor_sync_req_ids.difference_update(num_scheduled_tokens)
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1859,6 +1866,7 @@ class Scheduler(SchedulerInterface):
                 # first generated token.
                 if not suffix_hit:
                     del self._suffix_hits[req_id]
+                self._prefill_cursor_sync_req_ids.add(req_id)
                 if (
                     not suffix_hit
                     and suffix_end == request.num_tokens

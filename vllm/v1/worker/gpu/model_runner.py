@@ -1232,8 +1232,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
-        if envs.VLLM_SUFFIX_PRESERVING_EVICTION:
-            self.req_states.sync_prefill_num_computed_tokens(reqs.req_ids)
+        req_ids_to_sync = (
+            reqs.req_ids
+            if envs.VLLM_SUFFIX_PRESERVING_EVICTION
+            else scheduler_output.prefill_cursor_sync_req_ids or []
+        )
+        if req_ids_to_sync:
+            self.req_states.sync_prefill_num_computed_tokens(req_ids_to_sync)
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
