@@ -3,7 +3,10 @@
 This document records the branch layout, design, implementation boundaries,
 configuration, and validation status for the CPU/GPU prefix-pruning work. It is
 intended as a practical handoff and reference when comparing this checkout
-with the separate GPU reference checkout.
+with the separate GPU reference checkout. The implementation and runnable
+profiles described in Sections 2–9 are for `feat/cpu-gpu-prefix-pruning`;
+they must not be assumed to work on the separate v0.30 migration branch until
+that port is implemented and validated.
 
 ## 1. Branch and source-version record
 
@@ -13,11 +16,21 @@ with the separate GPU reference checkout.
 - Branch: `feat/cpu-gpu-prefix-pruning`
 - Intended starting point: `feat/prefix-based-eviction-policy-cpu`
 - Base commit: `5d0aeb5b9cfe507680f28f2eddae578e1a3cfc43`
-- At the time this document was written, that commit was also the tip of
-  `feat/prefix-based-eviction-policy-cpu`. The implementation and documentation
-  edits described below were worktree changes, not commits on this branch yet.
+- Combined implementation commit: `344354e2f4d985bb186f8945d8031565768ea96e`
+  (`CPU and GPU prefix pruning approach`), parented directly on the selected
+  CPU feature base.
+- Current branch tip when this note was updated:
+  `bb22c5fc05fb43c0026866a8faa90f201553b5ac` (`Make both plugginable`),
+  descendant of the combined implementation commit.
+- `feat/prefix-based-eviction-policy-cpu` remains at the base commit above;
+  the combined GPU+CPU changes are on `feat/cpu-gpu-prefix-pruning`.
 - The selected base already contains the CPU/offload suffix lookup and
   recomputation work that the user asked to retain.
+- After fetching official release tags, the base describes as
+  `v0.31.1rc0-100-g5d0aeb5b9c`, the combined commit as
+  `v0.31.1rc0-101-g344354e2f4`, and the current tip as
+  `v0.31.1rc0-102-gbb22c5fc05`. This is a development branch based on the
+  v0.31.1 release candidate, not v0.26, v0.28, or v0.30.
 
 ### GPU reference checkout
 
@@ -26,21 +39,91 @@ with the separate GPU reference checkout.
 - Reference commit: `75e061ae2f`
 - `git describe --tags` at inspection: `v0.26.0-7-g75e061ae2f`
 
-### Version caveat
+### Installed runtime version string
 
-The original concern was that the GPU reference might be based on vLLM 0.26 and
-the CPU feature branch on vLLM 0.28. The local Git metadata inspected for this
-handoff does **not** confirm that distinction: both the selected CPU-feature
-base and the GPU reference worktree describe from the `v0.26.0` tag. The
-combined checkout described as `v0.26.0-7-g5d0aeb5b9c` at its base.
+The user supplied this exact output from `vllm --version`:
 
-`git describe` identifies the nearest reachable tag, not necessarily the exact
-version used when an implementation was first authored or tested. If 0.28 refers
-to a different historical branch/checkout, record that checkout's commit or
-tag before treating it as the CPU implementation's source version. In either
-case, code should not be copied mechanically across vLLM versions: scheduler,
-block-pool, connector, and request lifecycle APIs can differ. This combined
-branch adapts behavior to the APIs in the selected checkout.
+```text
+Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+0.1.dev22660+g344354e2f.cpu
+```
+
+The hash `g344354e2f` resolves in `/home/ubuntu/sneh/vllm` to commit
+`344354e2f4d985bb186f8945d8031565768ea96e`, the combined
+`CPU and GPU prefix pruning approach` commit. That commit is one commit after
+the `v0.31.1rc0`-based CPU feature branch. The `.cpu` suffix identifies the
+reported package as a CPU-flavored build; it does not verify a CUDA-capable
+installation.
+
+The separately inspected GPU reference checkout
+(`/home/ubuntu/sneh/opensource/eviction/vllm`, branch
+`feat/idle-demote-protect-suffix`, commit
+`75e061ae2f5a5af29949034e424819ecbc425b47`) does not contain `344354e2f`.
+Its `git describe` output at inspection was `v0.26.0-7-g75e061ae2f`. It is a
+separate code reference and is not the base of the combined branch.
+
+The `_C_AVX2` message is an import warning for the optional compiled CPU
+extension. `vllm/platforms/cpu.py` tries to import it on x86 when selecting the
+AVX2 path, while `setup.py` declares the extension for CPU builds. Its absence
+means that this native module was not available in the environment; it is
+separate from the version string, which the CLI still printed. The message
+alone does not establish whether CPU inference will fail or fall back for a
+particular installation. Check the full startup logs and CPU build/install
+configuration. It also says nothing about CUDA availability; validate a
+CUDA-capable runtime separately before serving GPU profiles.
+
+The vLLM version string, Git tag ancestry, and feature's original development
+checkout are different kinds of evidence. Keep all three recorded when
+comparing implementations; do not copy scheduler, block-pool, connector, or
+request-lifecycle code mechanically across versions.
+
+### Stable v0.30 migration status
+
+The selected stable target is the official vLLM `v0.30.0` tag:
+
+- Tag commit: `ced6857afa0ea7b2e3f0846a62e1394e90f15607`.
+- Local worktree: `/home/ubuntu/sneh/vllm-v0.30`.
+- Local branch: `feat/cpu-gpu-prefix-pruning-v0.30`.
+- The worktree was created at the tag and remains separate from the source
+  branch. The stable port is now implemented in that worktree; see
+  `/home/ubuntu/sneh/vllm-v0.30/PREFIX_PRUNING_README.md` for its file-by-file
+  migration record and profile instructions.
+- A direct cherry-pick of `344354e2f` was attempted and then aborted after
+  conflicts. No cherry-picked changes were kept in the v0.30 worktree.
+
+The direct-application conflicts are evidence that this is a port, not a
+version-label change. They affected the scheduler, GPU block pool and KV-cache
+manager/coordinator/utilities, environment settings, CPU policy factory, and
+tests. Several feature-specific source files did not exist at the target paths
+and were reported as modify/delete conflicts: the shared prefix-pruning core,
+CPU prefix-pruning policy and its tests, and the suffix-lookup guide. The
+profile/benchmark script also needs deliberate review rather than blind
+cherry-picking. Exact conflicts should be re-evaluated during implementation
+because the failed cherry-pick was aborted and is not a migration patch.
+
+The initial v0.30 source inspection found the following useful distinction;
+the implementation column below records the current port:
+
+| Area | What v0.30 already provides | Port adaptation |
+| --- | --- | --- |
+| Request identity | `Request.session_id` is present and used by existing cache code. | Added arrival/completion observation and session idle tracking; finish handling remains distinct from preemption. |
+| GPU cache | `BlockPool` has the standard free-block queue and allocation/reset lifecycle. | Added tier-aware free queues, freed/session metadata, idle demotion, dead-session promotion, and suffix/gap scheduling hooks. |
+| CPU offload | `CachePolicy`, `CachePolicyFactory`, and `CPUOffloadingManager` provide a pluggable policy seam. | Added prefix-tier and session-aware policies, extra-config wiring, request session identity, and end-token positions on offload keys. |
+| Suffix lookup | v0.30 has general offload lookup/load support. | Added full-attention CPU hit-run lookup, segmented CPU-to-GPU loading, and scheduler gap recomputation for supported configurations. |
+| Filesystem tier | v0.30 has tiering infrastructure. | Filesystem-tier scoring is intentionally not included in this CPU/GPU-only port. |
+| Operations/tests | v0.30 has its own CLI/config/docs and test layout. | Added `server.sh`, port documentation, and focused CPU/GPU/connector tests. |
+
+In particular, the presence of `session_id` in v0.30 should avoid inventing a
+second request-identity mechanism, but it does not eliminate the work of
+tracking inter-turn gaps, distinguishing completion from preemption, retaining
+session ownership on free blocks, and ordering eviction candidates.
+
+Focused v0.30 validation has passed for the CPU policy/manager, GPU cache
+utilities and cache manager, deferred frees, scheduler behavior, and the
+offloading connector scheduler. These are unit-level results, not a live model
+run. The v0.30 README records exact commands and compatibility boundaries;
+continue to treat end-to-end model serving as unverified until tested on the
+target hardware and model.
 
 ## 2. What the feature does
 
@@ -168,10 +251,9 @@ Specific edited paths, grouped by responsibility:
 | Tests | `tests/v1/core/test_prefix_caching.py`, `tests/v1/core/test_scheduler.py`, `tests/v1/kv_offload/cpu/policies/test_prefix_pruning.py` |
 | Operation and profile docs | `server.sh`, `docs/features/kv_offloading_usage.md`, `docs/features/kv_offload_prefix_pruning_lookup.md` |
 
-At the time of writing, `scripts/tier_ttft_bench.py` was also modified in the
-worktree, but that edit predated this implementation work and was deliberately
-left untouched. Check `git status` before staging so it is not accidentally
-bundled with the feature unless intended.
+The benchmark script `scripts/tier_ttft_bench.py` was also modified during the
+profile/benchmark work. Review its diff independently before staging it with
+the core implementation.
 
 ## 5. How to run the profiles
 
