@@ -9,6 +9,7 @@ import os
 import random
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -30,14 +31,18 @@ BLOCK_SIZE = 256
 WRITE_DRAIN_MIN_SEC = 60
 WRITE_DRAIN_MAX_SEC = 900
 SERVER_READY_TIMEOUT = 600
+DEFAULT_REQUESTS_PER_LENGTH = 1
+DEFAULT_FS_CAPACITY_GIB = 8.0
 
 VENV_BIN = Path("/home/ubuntu/build/vllm-cpu-evict/bin")
 REPO = Path("/home/ubuntu/dev/vllm-cpu-eviction")
 DEFAULT_RESULTS_DIR = REPO / "bench_results" / "tier_ttft"
 
 
-def generate_exact_length_token_ids(tokenizer, target_length: int) -> list[int]:
-    """Deterministic prompt of exact length; distinct prefixes across lengths."""
+def generate_exact_length_token_ids(
+    tokenizer, target_length: int, variant: int = 0
+) -> list[int]:
+    """Deterministic prompt of exact length; unique prefix per variant."""
     text_blocks = [
         "The quick brown fox jumps over the lazy dog. ",
         "Artificial intelligence is rapidly transforming global infrastructure. ",
@@ -52,13 +57,13 @@ def generate_exact_length_token_ids(tokenizer, target_length: int) -> list[int]:
         "Cybersecurity measures are essential for protecting modern digital assets. ",
         "The Renaissance was a fervent period of European cultural rebirth. ",
     ]
-    rng = random.Random(target_length)
+    rng = random.Random(f"{target_length}:{variant}")
     tokens: list[int] = []
     if tokenizer.bos_token_id is not None:
         tokens.append(tokenizer.bos_token_id)
 
     deterministic_uuid = uuid.uuid5(
-        uuid.NAMESPACE_OID, f"tier_ttft_bench_{target_length}"
+        uuid.NAMESPACE_OID, f"tier_ttft_bench_{target_length}_{variant}"
     )
     unique_prefix_str = f"CACHE_BUSTER_{deterministic_uuid.hex} | "
     tokens.extend(tokenizer.encode(unique_prefix_str, add_special_tokens=False))
@@ -144,7 +149,9 @@ def clean_storage(root_dir: str) -> None:
             print(f"[warn] could not remove {child}: {exc}")
 
 
-def kv_transfer_config(root_dir: str) -> str:
+def kv_transfer_config(
+    root_dir: str, fs_capacity_bytes: int, fs_eviction_policy: str
+) -> str:
     cfg = {
         "kv_connector": "OffloadingConnector",
         "kv_role": "kv_both",
@@ -159,8 +166,8 @@ def kv_transfer_config(root_dir: str) -> str:
                     "root_dir": root_dir,
                     "n_read_threads": 32,
                     "n_write_threads": 16,
-                    "capacity_bytes": 48318382080,
-                    "eviction_policy": "prefix_pruning",
+                    "capacity_bytes": fs_capacity_bytes,
+                    "eviction_policy": fs_eviction_policy,
                     "session_dead_ttl_s": 200,
                     "max_tiers": 8
                 }
@@ -170,7 +177,12 @@ def kv_transfer_config(root_dir: str) -> str:
     return json.dumps(cfg)
 
 
-def start_server(root_dir: str, log_path: Path) -> subprocess.Popen:
+def start_server(
+    root_dir: str,
+    log_path: Path,
+    fs_capacity_bytes: int,
+    fs_eviction_policy: str,
+) -> subprocess.Popen:
     env = os.environ.copy()
     env["VLLM_KV_CONNECTOR_HIT_LOG"] = "1"
     env["PYTHONHASHSEED"] = "0"
@@ -190,7 +202,7 @@ def start_server(root_dir: str, log_path: Path) -> subprocess.Popen:
         "--max-model-len",
         "262144",
         "--kv-transfer-config",
-        kv_transfer_config(root_dir),
+        kv_transfer_config(root_dir, fs_capacity_bytes, fs_eviction_policy),
     ]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # Line-buffered so hit/metrics lines are visible during the run.
@@ -320,30 +332,38 @@ def run_phase(
     tokenizer,
     phase: str,
     log_path: Path,
+    requests_per_length: int,
 ) -> list[dict]:
     results = []
     for length in INPUT_LENS:
-        prompt_ids = generate_exact_length_token_ids(tokenizer, length)
-        assert len(prompt_ids) == length
-        print(f"[{phase}] input_len={length} sending...", flush=True)
-        t0 = time.perf_counter()
-        ttft = measure_ttft(prompt_ids, OUTPUT_LEN)
-        wall = time.perf_counter() - t0
-        row = {
-            "phase": phase,
-            "input_len": length,
-            "ttft_s": ttft,
-            "wall_s": wall,
-            "disk_hit_log_lines": 0,
-            "external_hit_tokens": 0,
-        }
-        results.append(row)
-        print(
-            f"[{phase}] input_len={length} ttft={ttft * 1000:.1f}ms "
-            f"wall={wall:.2f}s",
-            flush=True,
-        )
-        time.sleep(1)
+        for variant in range(requests_per_length):
+            prompt_ids = generate_exact_length_token_ids(tokenizer, length, variant)
+            assert len(prompt_ids) == length
+            print(
+                f"[{phase}] input_len={length} request={variant + 1}/"
+                f"{requests_per_length} sending...",
+                flush=True,
+            )
+            t0 = time.perf_counter()
+            ttft = measure_ttft(prompt_ids, OUTPUT_LEN)
+            wall = time.perf_counter() - t0
+            row = {
+                "phase": phase,
+                "input_len": length,
+                "request_index": variant + 1,
+                "ttft_s": ttft,
+                "wall_s": wall,
+                "disk_hit_log_lines": 0,
+                "external_hit_tokens": 0,
+            }
+            results.append(row)
+            print(
+                f"[{phase}] input_len={length} request={variant + 1}/"
+                f"{requests_per_length} ttft={ttft * 1000:.1f}ms "
+                f"wall={wall:.2f}s",
+                flush=True,
+            )
+            time.sleep(1)
     return results
 
 
@@ -373,8 +393,26 @@ def attach_hit_stats(results: list[dict], log_path: Path, phase: str) -> None:
 
 
 def plot_results(storage_name: str, results: list[dict], out_path: Path) -> None:
-    recomp = {r["input_len"]: r["ttft_s"] for r in results if r["phase"] == "recompute"}
-    reload = {r["input_len"]: r["ttft_s"] for r in results if r["phase"] == "reload"}
+    recomp = {
+        length: statistics.mean(
+            r["ttft_s"]
+            for r in results
+            if r["phase"] == "recompute" and r["input_len"] == length
+        )
+        for length in INPUT_LENS
+        if any(
+            r["phase"] == "recompute" and r["input_len"] == length for r in results
+        )
+    }
+    reload = {
+        length: statistics.mean(
+            r["ttft_s"]
+            for r in results
+            if r["phase"] == "reload" and r["input_len"] == length
+        )
+        for length in INPUT_LENS
+        if any(r["phase"] == "reload" and r["input_len"] == length for r in results)
+    }
     xs = [x for x in INPUT_LENS if x in recomp and x in reload]
     ys_r = [recomp[x] * 1000 for x in xs]
     ys_l = [reload[x] * 1000 for x in xs]
@@ -418,7 +456,13 @@ def plot_results(storage_name: str, results: list[dict], out_path: Path) -> None
 
 
 def run_storage(
-    storage_name: str, root_dir: str, tokenizer, results_dir: Path
+    storage_name: str,
+    root_dir: str,
+    tokenizer,
+    results_dir: Path,
+    requests_per_length: int,
+    fs_capacity_bytes: int,
+    fs_eviction_policy: str,
 ) -> list[dict]:
     results_dir.mkdir(parents=True, exist_ok=True)
     log_recomp = results_dir / f"{storage_name}_recompute_server.log"
@@ -433,24 +477,44 @@ def run_storage(
         clean_storage(root_dir)
 
         print(f"===== {storage_name}: phase 1 recompute =====", flush=True)
-        proc = start_server(root_dir, log_recomp)
+        proc = start_server(
+            root_dir, log_recomp, fs_capacity_bytes, fs_eviction_policy
+        )
         wait_ready(proc)
-        all_results.extend(run_phase(tokenizer, "recompute", log_recomp))
+        all_results.extend(
+            run_phase(tokenizer, "recompute", log_recomp, requests_per_length)
+        )
         attach_hit_stats(all_results, log_recomp, "recompute")
 
         wait_write_drain(log_recomp)
 
         stop_server(proc)
         proc = None
+        eviction_marker = (
+            "Storage tier 'fs' eviction active:"
+            if fs_eviction_policy == "prefix_pruning"
+            else "Storage tier 'fs' LRU eviction active:"
+        )
+        if eviction_marker in log_recomp.read_text(errors="replace"):
+            print(f"[check] confirmed FS eviction under {fs_eviction_policy}")
+        else:
+            print(
+                "[check] WARNING: no FS eviction summary found; "
+                "this run may not have exceeded its storage capacity."
+            )
 
         # Persist disk; clear CPU/shm so reload is storage-only.
         print(f"===== {storage_name}: clear /dev/shm before reload =====", flush=True)
         clean_shm()
 
         print(f"===== {storage_name}: phase 2 reload =====", flush=True)
-        proc = start_server(root_dir, log_reload)
+        proc = start_server(
+            root_dir, log_reload, fs_capacity_bytes, fs_eviction_policy
+        )
         wait_ready(proc)
-        all_results.extend(run_phase(tokenizer, "reload", log_reload))
+        all_results.extend(
+            run_phase(tokenizer, "reload", log_reload, requests_per_length)
+        )
 
         stop_server(proc)
         proc = None
@@ -502,7 +566,30 @@ def main() -> None:
         default=DEFAULT_RESULTS_DIR,
         help="Directory for server logs, JSON results, and plots",
     )
+    parser.add_argument(
+        "--requests-per-length",
+        type=int,
+        default=DEFAULT_REQUESTS_PER_LENGTH,
+        help="Distinct prompts per input length, run sequentially in each phase",
+    )
+    parser.add_argument(
+        "--fs-capacity-gib",
+        type=float,
+        default=DEFAULT_FS_CAPACITY_GIB,
+        help="FS tier capacity in GiB; lower this to force storage eviction",
+    )
+    parser.add_argument(
+        "--fs-eviction-policy",
+        choices=["lru", "prefix_pruning"],
+        default="prefix_pruning",
+        help="Eviction policy for the FS tier",
+    )
     args = parser.parse_args()
+    if args.requests_per_length < 1:
+        parser.error("--requests-per-length must be at least 1")
+    if args.fs_capacity_gib <= 0:
+        parser.error("--fs-capacity-gib must be positive")
+    fs_capacity_bytes = int(args.fs_capacity_gib * (1024**3))
     results_dir = args.results_dir.resolve()
 
     roots = {
@@ -512,10 +599,24 @@ def main() -> None:
 
     print(f"Loading tokenizer for {MODEL}...")
     print(f"Results dir: {results_dir}", flush=True)
+    print(
+        f"Benchmark workload: {args.requests_per_length} distinct prompt(s) "
+        f"per input length, sequential; FS capacity={args.fs_capacity_gib:g} GiB; "
+        f"FS eviction={args.fs_eviction_policy}",
+        flush=True,
+    )
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 
     for name in args.storages:
-        run_storage(name, roots[name], tokenizer, results_dir)
+        run_storage(
+            name,
+            roots[name],
+            tokenizer,
+            results_dir,
+            args.requests_per_length,
+            fs_capacity_bytes,
+            args.fs_eviction_policy,
+        )
 
     print("\nDone. Results in", results_dir)
 

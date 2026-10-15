@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -238,6 +239,13 @@ class KVCacheManager:
         tier_tokens: int = 0,
         max_tiers: int = 0,
         idle_ttl_s: float = 0.0,
+        session_dead_ttl_s: float = 0.0,
+        session_ewa_alpha: float = 0.3,
+        session_dead_k: float = 3.0,
+        session_min_gaps: int = 2,
+        session_detector: str = "ewa",
+        session_quantile: float = 0.95,
+        session_gap_window: int = 256,
     ) -> None:
         """Evict the leading blocks of freed requests first, and let
         `get_computed_blocks` return hits whose leading blocks were evicted.
@@ -258,6 +266,15 @@ class KVCacheManager:
                 are demoted into tier 0 before the next allocation, so finished
                 or long-idle sessions are reclaimed ahead of fresher later-tier
                 content.
+            session_dead_ttl_s: When > 0, blocks from sessions idle past the
+                configured think-time threshold are promoted before live
+                prefix tiers.
+            session_ewa_alpha: Smoothing factor for per-session think-time gaps.
+            session_dead_k: Standard-deviation multiplier for the EWA detector.
+            session_min_gaps: Gaps required before using the adaptive threshold.
+            session_detector: Per-session ``ewa`` or server-wide ``global``.
+            session_quantile: Quantile used by the global detector.
+            session_gap_window: Maximum number of recent gaps used globally.
         """
         manager = self.coordinator.single_type_managers[0]
         if (
@@ -286,11 +303,27 @@ class KVCacheManager:
             max_num_blocks = cdiv(self.max_model_len, block_size)
             full_tiers = 1 + max(0, cdiv(max_num_blocks - first_tier_len, tier_len))
             num_tiers = min(full_tiers, max_tiers) if max_tiers > 0 else full_tiers
-        self.block_pool.enable_prefix_first_eviction(num_tiers, idle_ttl_s)
+        self.block_pool.enable_prefix_first_eviction(
+            num_tiers,
+            idle_ttl_s,
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
+        )
         manager.enable_suffix_preserving_eviction(
             prefix_evict_fraction, first_tier_len, tier_len if first_tier_len else 0
         )
         self._suffix_hit_manager = manager
+
+    def note_session_arrival(self, request: Request) -> None:
+        tracker = self.block_pool.session_tracker
+        if tracker.enabled:
+            time_fn = getattr(self.block_pool, "_time_fn", time.monotonic)
+            tracker.on_arrival(request.session_id, time_fn())
 
     def get_suffix_hit(
         self, computed_blocks: KVCacheBlocks, num_prefix_hit_tokens: int
@@ -757,16 +790,22 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
-    def free(self, request: Request) -> None:
+    def free(self, request: Request, session_finished: bool = True) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
         first when caching is enabled.
 
         Args:
             request: The request to free the blocks.
+            session_finished: Whether this is a completed request turn. A
+                scheduler preemption frees KV but does not finish the session.
 
         """
-        self.coordinator.free(request.request_id)
+        if session_finished:
+            tracker = self.block_pool.session_tracker
+            time_fn = getattr(self.block_pool, "_time_fn", time.monotonic)
+            tracker.on_finish(request.session_id, time_fn())
+        self.coordinator.free(request.request_id, session_id=request.session_id)
 
     def remove_skipped_blocks(
         self,

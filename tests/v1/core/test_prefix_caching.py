@@ -3005,6 +3005,71 @@ def test_suffix_preserving_eviction_tiers(
     assert evicted == expected
 
 
+def test_dead_session_blocks_precede_live_prefixes():
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 9),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager.enable_suffix_preserving_eviction(
+        0.5,
+        2 * block_size,
+        2 * block_size,
+        idle_ttl_s=2.0,
+        session_dead_ttl_s=5.0,
+        session_min_gaps=1,
+    )
+    clock = [0.0]
+    manager.block_pool._time_fn = lambda: clock[0]
+
+    def run(req: Request, num_tokens: int) -> None:
+        computed_blocks, _, _ = manager.get_computed_blocks(req)
+        assert manager.allocate_slots(req, num_tokens, 0, computed_blocks)
+
+    req_dead = make_request(
+        "dead",
+        list(range(4 * block_size)),
+        block_size,
+        sha256,
+        session_id="dead-session",
+    )
+    manager.note_session_arrival(req_dead)
+    run(req_dead, 4 * block_size)
+    manager.free(req_dead)
+
+    clock[0] = 1.0
+    req_live = make_request(
+        "live",
+        list(range(1000, 1000 + 4 * block_size)),
+        block_size,
+        sha256,
+        session_id="live-session",
+    )
+    manager.note_session_arrival(req_live)
+    run(req_live, 4 * block_size)
+    manager.free(req_live)
+
+    # The older session is expired while the later one remains within its TTL.
+    clock[0] = 5.5
+    filler = make_request(
+        "filler", list(range(2000, 2000 + 4 * block_size)), block_size, sha256
+    )
+    run(filler, 4 * block_size)
+
+    dead_cached = [
+        manager.block_pool.get_cached_block(block_hash, [0]) is not None
+        for block_hash in req_dead.block_hashes
+    ]
+    live_cached = [
+        manager.block_pool.get_cached_block(block_hash, [0]) is not None
+        for block_hash in req_live.block_hashes
+    ]
+    assert not any(dead_cached)
+    assert all(live_cached)
+
+
 def test_hash_block_correct_reuse():
     """This tests when a previously cached block is reused as a new block,
     its hash metadata should be correctly reset.

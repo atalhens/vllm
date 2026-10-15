@@ -345,6 +345,30 @@ time (`offload suffix hit: gap … load …`).
 | Prefix-cache registration | `vllm/v1/core/kv_cache_manager.py` (`register_offload_suffix_hit`) |
 | Unit tests | `tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py` (`TestOffloadSuffixHit`) |
 
+## GPU prefix-pruning profiles
+
+Set `VLLM_SUFFIX_PRESERVING_EVICTION=1` to enable GPU prefix-first eviction.
+`VLLM_SUFFIX_EVICTION_TIER_TOKENS` and
+`VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS` set the initial tier and its growth;
+`VLLM_SUFFIX_EVICTION_MAX_TIERS` caps prefix tiers; and
+`VLLM_SUFFIX_EVICTION_IDLE_TTL_S` enables idle demotion. For session-aware
+eviction, set `VLLM_SUFFIX_SESSION_DEAD_TTL_S` to a positive value. Finished
+sessions past that floor are promoted ahead of live prefixes. The detector
+defaults to per-session EWA (`VLLM_SUFFIX_SESSION_DETECTOR=ewa`), with alpha
+0.3, `k=3`, and two gaps required before adapting the threshold. Requests need
+a session ID for this policy to distinguish sessions. `session_dead_ttl_s=0`
+leaves plain prefix pruning enabled without session promotion.
+
+From the repository root, [`server.sh`](../../server.sh) provides runnable
+`gpu-prefix`, `gpu-sessions`, and `gpu-sessions-global` profiles, alongside
+CPU/offload profiles. The GPU profiles use the device-cache suffix lookup and
+gap-recompute path and must not be launched with an `OffloadingConnector`.
+
+This GPU eviction path is incompatible with KV connectors, speculative
+decoding, context/pipeline parallelism, and encoder-decoder models. The
+connector's own suffix lookup and gap-recompute path remains available when
+GPU suffix-preserving eviction is disabled.
+
 ---
 
 ## Related docs

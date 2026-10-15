@@ -48,7 +48,7 @@ def test_defaults_match_sessions_arm() -> None:
 def test_factory_resolves_prefix_pruning() -> None:
     assert (
         CachePolicyFactory.get_cache_policy_cls("prefix_pruning")
-        is PrefixPruningOnSessionsCachePolicy
+        is PrefixPruningCachePolicy
     )
     assert (
         CachePolicyFactory.get_cache_policy_cls("prefix_pruning_on_sessions")
@@ -62,6 +62,14 @@ def test_factory_resolves_prefix_pruning() -> None:
     assert isinstance(manager._policy, PrefixPruningOnSessionsCachePolicy)
     assert manager._policy.session_dead_ttl_s == 120.0
     assert manager._policy.first_tier_tokens == 8192
+
+
+def test_plain_prefix_pruning_disables_session_promotion_by_default() -> None:
+    policy = PrefixPruningCachePolicy(cache_capacity=4)
+    assert policy.first_tier_tokens == 16384
+    assert policy.tier_step_tokens == 16384
+    assert policy.max_tiers == 8
+    assert policy.session_dead_ttl_s == 0.0
 
 
 def test_evicts_leading_prefix_before_suffix() -> None:

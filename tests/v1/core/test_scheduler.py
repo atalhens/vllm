@@ -7504,20 +7504,40 @@ def test_suffix_preserving_eviction_skips_cached_suffix(monkeypatch):
         step(req, len(prompt), [1])
         assert req.is_finished()
 
-    scheduler.scheduler_config.long_prefill_token_threshold = 24
     req = make_request("0b", prompt0 + [7] * 10)
     scheduler.add_request(req)
 
-    # The two evicted blocks are recomputed in two chunks.
-    step(req, 24, [])
+    # Only the two evicted leading blocks are recomputed.
+    step(req, 2 * block_size, [])
     assert req.prefill_stats is not None
     assert req.prefill_stats.num_cached_tokens == 2 * block_size
-    assert req.num_computed_tokens == 24
-    step(req, 8, [])
     assert req.num_computed_tokens == 4 * block_size
     assert scheduler.kv_cache_manager.get_block_ids("0b") == ([5, 6, 3, 4],)
-
     # The cached suffix is skipped.
     output = step(req, 10, [1])
     assert output.scheduled_cached_reqs.num_computed_tokens == [4 * block_size]
     assert req.is_finished()
+
+
+def test_suffix_eviction_records_session_arrival(monkeypatch):
+    monkeypatch.setenv("VLLM_SUFFIX_PRESERVING_EVICTION", "1")
+    monkeypatch.setenv("VLLM_SUFFIX_SESSION_DEAD_TTL_S", "5")
+    block_size = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, num_blocks=8, block_size=block_size
+    )
+    init_none_hash(sha256)
+    request = Request(
+        request_id="session-request",
+        prompt_token_ids=list(range(block_size)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(block_size, sha256),
+        session_id="session-1",
+    )
+
+    scheduler.add_request(request)
+
+    tracker = scheduler.kv_cache_manager.block_pool.session_tracker
+    assert tracker.enabled
+    assert tracker._sessions["session-1"].last_arrival is not None

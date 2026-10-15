@@ -280,5 +280,33 @@ class PrefixPruningOnSessionsCachePolicy(CachePolicy):
         self._evictable.discard(key)
 
 
-# Live-benchmark / extra_config alias: same class.
-PrefixPruningCachePolicy = PrefixPruningOnSessionsCachePolicy
+class PrefixPruningCachePolicy(PrefixPruningOnSessionsCachePolicy):
+    """Prefix-tier eviction without dead-session promotion by default."""
+
+    def __init__(
+        self,
+        cache_capacity: int,
+        first_tier_tokens: int = 16384,
+        tier_step_tokens: int = 16384,
+        max_tiers: int = 8,
+        session_dead_ttl_s: float = 0.0,
+        session_ewa_alpha: float = 0.3,
+        session_dead_k: float = 3.0,
+        session_min_gaps: int = 2,
+        session_detector: str = "ewa",
+        session_quantile: float = 0.95,
+        session_gap_window: int = 256,
+    ) -> None:
+        super().__init__(
+            cache_capacity=cache_capacity,
+            first_tier_tokens=first_tier_tokens,
+            tier_step_tokens=tier_step_tokens,
+            max_tiers=max_tiers,
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
+        )

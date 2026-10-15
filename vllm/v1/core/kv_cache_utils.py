@@ -203,6 +203,8 @@ class KVCacheBlock:
     # (hashed) block. None for never-allocated blocks. Used by idle-TTL
     # demotion under suffix-preserving eviction.
     freed_at: float | None = None
+    # Session whose request most recently freed this cached block.
+    session_id: str | None = None
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -582,6 +584,26 @@ class TieredFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             prev_block = block
         prev_block.next_free_block = boundary
         boundary.prev_free_block = prev_block
+        self.num_free_blocks += len(blocks)
+
+    def prepend_n_to_tier(self, blocks: list[KVCacheBlock], tier: int) -> None:
+        """Prepend blocks to an evict-first tier, preserving their order."""
+        if not blocks:
+            return
+        anchor = (
+            self.fake_free_list_head
+            if tier == 0
+            else self._boundaries[tier - 1]
+        )
+        first = anchor.next_free_block
+        assert first is not None
+        previous = anchor
+        for block in blocks:
+            block.prev_free_block = previous
+            previous.next_free_block = block
+            previous = block
+        previous.next_free_block = first
+        first.prev_free_block = previous
         self.num_free_blocks += len(blocks)
 
     def demote_idle(self, ttl_s: float, now: float | None = None) -> int:

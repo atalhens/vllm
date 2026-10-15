@@ -1751,30 +1751,54 @@ class Scheduler(SchedulerInterface):
         step_tokens = envs.VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS
         max_tiers = envs.VLLM_SUFFIX_EVICTION_MAX_TIERS
         idle_ttl_s = envs.VLLM_SUFFIX_EVICTION_IDLE_TTL_S
+        session_dead_ttl_s = envs.VLLM_SUFFIX_SESSION_DEAD_TTL_S
+        session_ewa_alpha = envs.VLLM_SUFFIX_SESSION_EWA_ALPHA
+        session_dead_k = envs.VLLM_SUFFIX_SESSION_DEAD_K
+        session_min_gaps = envs.VLLM_SUFFIX_SESSION_MIN_GAPS
+        session_detector = envs.VLLM_SUFFIX_SESSION_DETECTOR
+        session_quantile = envs.VLLM_SUFFIX_SESSION_QUANTILE
+        session_gap_window = envs.VLLM_SUFFIX_SESSION_GAP_WINDOW
         if tier_tokens < 0 or step_tokens < 0:
             raise ValueError("Suffix eviction tier sizes must not be negative")
         if max_tiers < 0:
             raise ValueError("VLLM_SUFFIX_EVICTION_MAX_TIERS must not be negative")
         if idle_ttl_s < 0:
             raise ValueError("VLLM_SUFFIX_EVICTION_IDLE_TTL_S must not be negative")
+        if session_dead_ttl_s < 0:
+            raise ValueError("VLLM_SUFFIX_SESSION_DEAD_TTL_S must not be negative")
         self.kv_cache_manager.enable_suffix_preserving_eviction(
-            fraction, tier_tokens, step_tokens, max_tiers, idle_ttl_s
+            fraction,
+            tier_tokens,
+            step_tokens,
+            max_tiers,
+            idle_ttl_s,
+            session_dead_ttl_s=session_dead_ttl_s,
+            session_ewa_alpha=session_ewa_alpha,
+            session_dead_k=session_dead_k,
+            session_min_gaps=session_min_gaps,
+            session_detector=session_detector,
+            session_quantile=session_quantile,
+            session_gap_window=session_gap_window,
         )
         if tier_tokens:
             logger.info(
                 "Suffix-preserving eviction enabled with eviction tiers of %d "
-                "tokens, then steps of %d tokens (max_tiers=%s, idle_ttl_s=%s).",
+                "tokens, then steps of %d tokens (max_tiers=%s, idle_ttl_s=%s, "
+                "session_dead_ttl_s=%s, session_detector=%s).",
                 tier_tokens,
                 step_tokens or tier_tokens,
                 max_tiers or "uncapped",
                 idle_ttl_s or "off",
+                session_dead_ttl_s or "off",
+                session_detector if session_dead_ttl_s else "off",
             )
         else:
             logger.info(
                 "Suffix-preserving eviction enabled with prefix fraction %.2f "
-                "(idle_ttl_s=%s).",
+                "(idle_ttl_s=%s, session_dead_ttl_s=%s).",
                 fraction,
                 idle_ttl_s or "off",
+                session_dead_ttl_s or "off",
             )
 
     def _get_new_block_ids_to_zero(self) -> list[int] | None:
@@ -2921,6 +2945,7 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            self.kv_cache_manager.note_session_arrival(request)
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3034,7 +3059,7 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
-        self._free_request_blocks(request)
+        self._free_request_blocks(request, session_finished=True)
         del self.requests[request.request_id]
 
     @property
@@ -3052,14 +3077,16 @@ class Scheduler(SchedulerInterface):
             request.last_sched_seq <= self.processed_step_seq
         )
 
-    def _free_request_blocks(self, request: Request):
+    def _free_request_blocks(
+        self, request: Request, *, session_finished: bool = False
+    ):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
         self._suffix_hits.pop(request.request_id, None)
         self._offload_suffix_ready.discard(request.request_id)
         if self._request_blocks_can_be_freed(request):
-            self.kv_cache_manager.free(request)
+            self.kv_cache_manager.free(request, session_finished=session_finished)
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:

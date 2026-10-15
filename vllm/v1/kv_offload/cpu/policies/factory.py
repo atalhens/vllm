@@ -96,11 +96,11 @@ CachePolicyFactory.register_cache_policy(
     "vllm.v1.kv_offload.cpu.policies.prefix_pruning",
     "PrefixPruningOnSessionsCachePolicy",
 )
-# Short alias for the same class.
+# Prefix pruning without session-dead promotion.
 CachePolicyFactory.register_cache_policy(
     "prefix_pruning",
     "vllm.v1.kv_offload.cpu.policies.prefix_pruning",
-    "PrefixPruningOnSessionsCachePolicy",
+    "PrefixPruningCachePolicy",
 )
 
 # Knobs PrefixPruningOnSessionsCachePolicy accepts from extra_config.

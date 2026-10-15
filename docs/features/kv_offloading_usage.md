@@ -103,7 +103,7 @@ vllm serve <model> \
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |
 | `blocks_per_chunk` | no | `1` | both | Offloaded chunk size in GPU blocks; must be > 0. Alternative to `block_size` for models whose KV cache groups have different block sizes. |
-| `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). |
+| `eviction_policy` | no | `lru` | both | Primary tier policy: `lru`, `arc`, `prefix_pruning`, `prefix_pruning_on_sessions`, or a custom `CachePolicy` name. |
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
@@ -111,6 +111,41 @@ vllm serve <model> \
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
+
+## CPU-tier prefix pruning
+
+Set the top-level `eviction_policy` in `kv_connector_extra_config` to
+`prefix_pruning` for shallow-prefix-first eviction, or to
+`prefix_pruning_on_sessions` to also prioritize blocks belonging to sessions
+predicted to be finished. The CPU policy supports the same prefix tier settings
+as the GPU policy; its default tier width is 16,384 tokens and the default
+session policy uses a 200-second idle floor, EWA alpha 0.3, and two observed
+gaps before adapting the threshold. Plain `prefix_pruning` disables
+session-dead promotion by default. Both policies use the existing offload
+lookup path, which can load a surviving suffix and recompute the missing gap.
+
+Prefix settings can be supplied at the top level or under
+`eviction_policy_config`, for example:
+
+```json
+{
+  "cpu_bytes_to_use": 10737418240,
+  "eviction_policy": "prefix_pruning_on_sessions",
+  "first_tier_tokens": 16384,
+  "tier_step_tokens": 16384,
+  "max_tiers": 8,
+  "session_dead_ttl_s": 200
+}
+```
+
+For runnable profile examples from the repository root, use
+[`server.sh`](../../server.sh). For example,
+`./server.sh cpu-prefix 0 8000 <model>` starts plain CPU-tier prefix pruning,
+and `./server.sh cpu-sessions 0 8000 <model>` starts its session-aware
+variant. `cpu-fs-prefix` and `cpu-fs-sessions` add a capacity-bounded
+filesystem tier. The script also provides GPU-only profiles; those cannot be
+combined with `OffloadingConnector`. Run `./server.sh --help` for the profile
+list, configuration variables, and a session-aware request example.
 
 ## Custom Eviction Policies
 

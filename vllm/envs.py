@@ -335,6 +335,13 @@ if TYPE_CHECKING:
     VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS: int = 0
     VLLM_SUFFIX_EVICTION_MAX_TIERS: int = 0
     VLLM_SUFFIX_EVICTION_IDLE_TTL_S: float = 0.0
+    VLLM_SUFFIX_SESSION_DEAD_TTL_S: float = 0.0
+    VLLM_SUFFIX_SESSION_EWA_ALPHA: float = 0.3
+    VLLM_SUFFIX_SESSION_DEAD_K: float = 3.0
+    VLLM_SUFFIX_SESSION_MIN_GAPS: int = 2
+    VLLM_SUFFIX_SESSION_DETECTOR: str = "ewa"
+    VLLM_SUFFIX_SESSION_QUANTILE: float = 0.95
+    VLLM_SUFFIX_SESSION_GAP_WINDOW: int = 256
 
 
 def get_default_cache_root():
@@ -2294,6 +2301,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SUFFIX_EVICTION_IDLE_TTL_S": lambda: float(
         os.getenv("VLLM_SUFFIX_EVICTION_IDLE_TTL_S", "0")
     ),
+    # Session idle floor and think-time detector used to prioritize all
+    # remaining cached blocks from sessions predicted to be finished.
+    "VLLM_SUFFIX_SESSION_DEAD_TTL_S": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_DEAD_TTL_S", "0")
+    ),
+    "VLLM_SUFFIX_SESSION_EWA_ALPHA": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_EWA_ALPHA", "0.3")
+    ),
+    "VLLM_SUFFIX_SESSION_DEAD_K": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_DEAD_K", "3")
+    ),
+    "VLLM_SUFFIX_SESSION_MIN_GAPS": lambda: int(
+        os.getenv("VLLM_SUFFIX_SESSION_MIN_GAPS", "2")
+    ),
+    "VLLM_SUFFIX_SESSION_DETECTOR": lambda: os.getenv(
+        "VLLM_SUFFIX_SESSION_DETECTOR", "ewa"
+    ),
+    "VLLM_SUFFIX_SESSION_QUANTILE": lambda: float(
+        os.getenv("VLLM_SUFFIX_SESSION_QUANTILE", "0.95")
+    ),
+    "VLLM_SUFFIX_SESSION_GAP_WINDOW": lambda: int(
+        os.getenv("VLLM_SUFFIX_SESSION_GAP_WINDOW", "256")
+    ),
     # Whether to skip version suffix when building package
     "VLLM_SKIP_VERSION_SUFFIX": lambda: bool(
         int(os.getenv("VLLM_SKIP_VERSION_SUFFIX", "0"))
@@ -2459,6 +2489,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS",
         "VLLM_SUFFIX_EVICTION_MAX_TIERS",
         "VLLM_SUFFIX_EVICTION_IDLE_TTL_S",
+        "VLLM_SUFFIX_SESSION_DEAD_TTL_S",
+        "VLLM_SUFFIX_SESSION_EWA_ALPHA",
+        "VLLM_SUFFIX_SESSION_DEAD_K",
+        "VLLM_SUFFIX_SESSION_MIN_GAPS",
+        "VLLM_SUFFIX_SESSION_DETECTOR",
+        "VLLM_SUFFIX_SESSION_QUANTILE",
+        "VLLM_SUFFIX_SESSION_GAP_WINDOW",
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
     }

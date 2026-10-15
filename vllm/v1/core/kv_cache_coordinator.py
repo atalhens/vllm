@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
@@ -391,7 +392,7 @@ class KVCacheCoordinator(ABC):
         )
         return all([pool.reset_prefix_cache() for pool in pools])
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, session_id: str | None = None) -> None:
         """Free the blocks for the request.
 
         Args:
@@ -399,7 +400,10 @@ class KVCacheCoordinator(ABC):
 
         """
         for manager in self.single_type_managers:
-            manager.free(request_id)
+            if isinstance(manager, FullAttentionManager):
+                manager.free(request_id, session_id=session_id)
+            else:
+                manager.free(request_id)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping from all single-type managers and
