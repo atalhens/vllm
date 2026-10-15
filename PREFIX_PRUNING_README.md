@@ -83,22 +83,30 @@ without starting a server. Set `DRY_RUN=1` to print the resolved command.
 `VLLM_BIN` can point to a CLI installed for this checkout; avoid mixing the
 executable from one worktree with Python imports from another.
 
-### Fast logic check (no model or GPU required)
+### Live server smoke test
 
-Run the focused deterministic checks from this checkout:
+Start one of the desired profiles with `server.sh`, then in another terminal
+run:
 
 ```bash
-PYTHON=/path/to/checkout/python ./scripts/check_prefix_pruning.sh
+BASE_URL=http://127.0.0.1:8000 \
+MODEL=meta-llama/Llama-3.1-8B-Instruct \
+./scripts/smoke_prefix_pruning_live.sh
 ```
 
-If the checkout's Python is already active, `./scripts/check_prefix_pruning.sh`
-is enough. The checks assert that CPU prefix tiers evict shallower entries
-first, a finished session's CPU entry is evicted while another entry remains,
-the GPU block pool promotes/reuses the finished session's block before the
-active session's cached block, CPU suffix spans are planned into GPU block
-segments, and the scheduler advances over those cached spans. These tests
-exercise eviction selection and transfer planning; they do not copy KV data
-on actual GPU hardware or demonstrate serving latency savings.
+`MODEL` can be omitted when the server exposes a model at `/v1/models`. Set
+`API_KEY` if the endpoint requires bearer authentication. The script checks
+that the server responds, sends the same sufficiently long prompt twice with
+the same session ID, adds a few distinct cache-fill prompts, and retries the
+original prompt from another session. It checks successful completions and
+looks for a local prefix-cache hit in `/metrics`; it also reports CPU/offload
+cache hits if GPU pressure caused blocks to spill. Set `PROMPT_WORDS` and
+`UNIQUE_REQUESTS` to adjust the small workload.
+
+This is a live API smoke test, not a deterministic eviction proof. A CPU spill
+or a particular session surviving/being pruned depends on available cache
+capacity and request pressure. The focused unit tests below verify eviction
+ordering and CPU suffix-load planning deterministically.
 
 The script exposes the following tuning variables:
 
@@ -157,6 +165,22 @@ CONFIG_ONLY=1 ./server.sh cpu-gpu-sessions
 
 The compile and launcher checks passed. `CONFIG_ONLY` printed the expected
 session-aware CPU offload policy and GPU-tier settings.
+
+The deterministic logic checks passed all 6 selected tests. They include
+assertions that a finished-session GPU block is reused before an active-session
+block, the CPU policy removes the finished session's entry while retaining the
+other entry, and disjoint CPU suffix spans are planned into GPU destinations
+before the scheduler skips those spans. Run them with the checkout's Python:
+
+```bash
+PYTHONPATH="$PWD" /path/to/checkout/python -m pytest -q \
+  tests/v1/core/test_kv_cache_utils.py::test_tiered_free_block_queue_orders_and_demotes_idle_blocks \
+  tests/v1/core/test_kv_cache_utils.py::test_gpu_pool_reuses_dead_session_prefix_before_live_session_prefix \
+  tests/v1/kv_offload/cpu/policies/test_prefix_pruning.py::test_prefix_policy_evicts_shallow_tiers_before_lru_tail \
+  tests/v1/kv_offload/cpu/policies/test_prefix_pruning.py::test_dead_session_is_evicted_before_live_prefix \
+  tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py::test_prefix_pruning_offload_loads_disjoint_suffix_spans \
+  tests/v1/core/test_scheduler.py::test_scheduler_jumps_over_cached_suffix_spans
+```
 
 Focused pytest validation:
 
