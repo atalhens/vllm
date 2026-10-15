@@ -1725,9 +1725,9 @@ class Scheduler(SchedulerInterface):
         return connector.build_connector_meta(scheduler_output)
 
     def _enable_suffix_preserving_eviction(self) -> None:
+        # A connector owns the CPU/secondary tiers; GPU prefix-first eviction
+        # independently orders the local device free-block queue.
         unsupported = []
-        if self.connector is not None:
-            unsupported.append("KV connectors")
         if self.vllm_config.speculative_config is not None:
             unsupported.append("speculative decoding")
         if self.parallel_config.pipeline_parallel_size > 1:

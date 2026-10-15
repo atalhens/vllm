@@ -143,8 +143,9 @@ For runnable profile examples from the repository root, use
 `./server.sh cpu-prefix 0 8000 <model>` starts plain CPU-tier prefix pruning,
 and `./server.sh cpu-sessions 0 8000 <model>` starts its session-aware
 variant. `cpu-fs-prefix` and `cpu-fs-sessions` add a capacity-bounded
-filesystem tier. The script also provides GPU-only profiles; those cannot be
-combined with `OffloadingConnector`. Run `./server.sh --help` for the profile
+filesystem tier. The `cpu-gpu-*` profiles enable GPU pruning and CPU
+offloading in one server; `cpu-gpu-fs-*` also enable filesystem-tier pruning.
+GPU-only profiles remain available. Run `./server.sh --help` for the profile
 list, configuration variables, and a session-aware request example.
 
 ## Custom Eviction Policies

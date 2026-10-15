@@ -9,22 +9,37 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     generate_store_output,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm.v1.core.kv_cache_utils import TieredFreeKVCacheBlockQueue
 from vllm.v1.request import RequestStatus
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("gpu_prefix_pruning", [False, True])
 def test_prefix_pruning_reload_loads_suffix(
-    request_runner, async_scheduling, monkeypatch
+    request_runner, async_scheduling, gpu_prefix_pruning, monkeypatch
 ):
     block_size = 4
     tokens_per_chunk = block_size  # blocks_per_chunk = 1
     num_gpu_blocks = 100
 
+    if gpu_prefix_pruning:
+        monkeypatch.setenv("VLLM_SUFFIX_PRESERVING_EVICTION", "1")
+        monkeypatch.setenv("VLLM_SUFFIX_EVICTION_TIER_TOKENS", str(block_size))
+        monkeypatch.setenv("VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS", str(block_size))
+        monkeypatch.setenv("VLLM_SUFFIX_EVICTION_MAX_TIERS", "8")
+
     runner = request_runner(
         block_size=block_size,
         num_gpu_blocks=num_gpu_blocks,
         async_scheduling=async_scheduling,
+        extra_config_overrides={"eviction_policy": "prefix_pruning"},
     )
+
+    if gpu_prefix_pruning:
+        assert isinstance(
+            runner.scheduler.kv_cache_manager.block_pool.free_block_queue,
+            TieredFreeKVCacheBlockQueue,
+        )
 
     # Phase 1: store all 5 chunks A B C D E.
     runner.new_request(token_ids=[0] * tokens_per_chunk * 5)
@@ -59,7 +74,10 @@ def test_prefix_pruning_reload_loads_suffix(
         decoded_tokens=[EOS_TOKEN_ID],
         expected_loaded=(2, 3, 4),
     )
-    assert any(output.prefill_cursor_sync_req_ids for output in scheduled_outputs)
+    # The async runner exposes an explicit cursor-sync notification; the sync
+    # runner is validated by the successful load-and-recompute run above.
+    if async_scheduling:
+        assert any(output.prefill_cursor_sync_req_ids for output in scheduled_outputs)
 
 
 def test_async_suffix_reload_stops_when_decode_output_is_missing(

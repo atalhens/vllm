@@ -10,9 +10,13 @@
 #   cpu-sessions        CPU offload tier with session-aware prefix pruning.
 #   cpu-fs-prefix       CPU + bounded filesystem tier, prefix pruning on both.
 #   cpu-fs-sessions     CPU + bounded filesystem tier, session-aware on both.
-#   gpu-prefix          GPU suffix-preserving prefix pruning, no connector.
+#   gpu-prefix          GPU suffix-preserving prefix pruning, GPU-only profile.
 #   gpu-sessions        GPU prefix pruning with per-session EWA liveness.
 #   gpu-sessions-global GPU prefix pruning with global-quantile liveness.
+#   cpu-gpu-prefix      Plain prefix pruning in both GPU and CPU tiers.
+#   cpu-gpu-sessions    Session-aware pruning in both GPU and CPU tiers.
+#   cpu-gpu-fs-prefix   Plain prefix pruning in GPU, CPU, and bounded FS tiers.
+#   cpu-gpu-fs-sessions Session-aware pruning in GPU, CPU, and bounded FS tiers.
 #
 # Configuration is controlled with environment variables; see --help below.
 set -euo pipefail
@@ -32,14 +36,21 @@ Profiles:
   cpu-sessions         GPU + CPU offload, session-aware CPU prefix pruning.
   cpu-fs-prefix        CPU prefix pruning + bounded FS prefix pruning.
   cpu-fs-sessions      Session-aware pruning in CPU and bounded FS tiers.
-  gpu-prefix           GPU prefix pruning (incompatible with KV connectors).
+  gpu-prefix           GPU prefix pruning without CPU/FS offloading.
   gpu-sessions         GPU prefix pruning with per-session EWA detection.
   gpu-sessions-global  GPU prefix pruning with global-quantile detection.
+  cpu-gpu-prefix       Plain prefix pruning in both GPU and CPU tiers.
+  cpu-gpu-sessions     Session-aware pruning in both GPU and CPU tiers.
+  cpu-gpu-fs-prefix    Plain prefix pruning in GPU, CPU, and bounded FS tiers.
+  cpu-gpu-fs-sessions  Session-aware pruning in GPU, CPU, and bounded FS tiers.
 
 Examples:
   ./server.sh cpu-prefix 0 8000 meta-llama/Llama-3.1-8B-Instruct
   ./server.sh cpu-sessions 0 8000 meta-llama/Llama-3.1-8B-Instruct
   ./server.sh cpu-fs-sessions 0 8000 meta-llama/Llama-3.1-8B-Instruct
+  ./server.sh cpu-gpu-prefix 0 8000 meta-llama/Llama-3.1-8B-Instruct
+  ./server.sh cpu-gpu-sessions 0 8000 meta-llama/Llama-3.1-8B-Instruct
+  ./server.sh cpu-gpu-fs-sessions 0 8000 meta-llama/Llama-3.1-8B-Instruct
   ./server.sh gpu-prefix 0 8000 meta-llama/Llama-3.1-8B-Instruct
   ./server.sh gpu-sessions 0 8000 meta-llama/Llama-3.1-8B-Instruct
   ./server.sh gpu-sessions-global 0 8000 meta-llama/Llama-3.1-8B-Instruct
@@ -79,9 +90,11 @@ the same conversation. Example:
     -H 'Content-Type: application/json' \
     -d '{"model":"MODEL","session_id":"conversation-42","messages":[{"role":"user","content":"Hello"}]}'
 
-GPU prefix-pruning profiles cannot be combined with OffloadingConnector.
-The CPU/FS profiles use OffloadingConnector's suffix-hit and gap-recompute
-path; GPU prefix pruning uses the device cache's own suffix-hit path.
+The cpu-gpu-* profiles enable GPU eviction and the CPU offload policy in one
+server; cpu-gpu-fs-* profiles also add an independently configured FS tier.
+The GPU tier prunes local GPU blocks, while OffloadingConnector manages
+offloaded CPU/FS copies and suffix-hit/gap-recompute. GPU-only profiles use
+the device cache's suffix-hit path.
 EOF
 }
 
@@ -146,6 +159,28 @@ case "$PROFILE" in
     FS_POLICY="${FS_POLICY_OVERRIDE:-prefix_pruning_on_sessions}"
     NEEDS_SESSION=1
     ;;
+  cpu-gpu-prefix)
+    CPU_POLICY=prefix_pruning
+    GPU_POLICY=1
+    SESSION_DEAD_TTL_S=0
+    ;;
+  cpu-gpu-sessions)
+    CPU_POLICY=prefix_pruning_on_sessions
+    GPU_POLICY=1
+    NEEDS_SESSION=1
+    ;;
+  cpu-gpu-fs-prefix)
+    CPU_POLICY=prefix_pruning
+    FS_POLICY="${FS_POLICY_OVERRIDE:-prefix_pruning}"
+    GPU_POLICY=1
+    SESSION_DEAD_TTL_S=0
+    ;;
+  cpu-gpu-fs-sessions)
+    CPU_POLICY=prefix_pruning_on_sessions
+    FS_POLICY="${FS_POLICY_OVERRIDE:-prefix_pruning_on_sessions}"
+    GPU_POLICY=1
+    NEEDS_SESSION=1
+    ;;
   gpu-prefix)
     GPU_POLICY=1
     SESSION_DEAD_TTL_S=0
@@ -165,11 +200,6 @@ case "$PROFILE" in
     exit 2
     ;;
 esac
-
-if [[ -n "$CPU_POLICY" && "$GPU_POLICY" == 1 ]]; then
-  echo "GPU prefix pruning cannot be enabled together with OffloadingConnector." >&2
-  exit 2
-fi
 
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES="$GPU"
@@ -262,6 +292,16 @@ fi
 
 if [[ "${CONFIG_ONLY:-0}" == 1 ]]; then
   if [[ -n "$KV_TRANSFER_CONFIG" ]]; then
+    if ((GPU_POLICY)); then
+      echo "GPU eviction settings for '$PROFILE':" >&2
+      echo "  VLLM_SUFFIX_PRESERVING_EVICTION=$VLLM_SUFFIX_PRESERVING_EVICTION" >&2
+      echo "  VLLM_SUFFIX_EVICTION_TIER_TOKENS=$VLLM_SUFFIX_EVICTION_TIER_TOKENS" >&2
+      echo "  VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS=$VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS" >&2
+      echo "  VLLM_SUFFIX_EVICTION_MAX_TIERS=$VLLM_SUFFIX_EVICTION_MAX_TIERS" >&2
+      echo "  VLLM_SUFFIX_EVICTION_IDLE_TTL_S=$VLLM_SUFFIX_EVICTION_IDLE_TTL_S" >&2
+      echo "  VLLM_SUFFIX_SESSION_DEAD_TTL_S=$VLLM_SUFFIX_SESSION_DEAD_TTL_S" >&2
+      echo "  VLLM_SUFFIX_SESSION_DETECTOR=$VLLM_SUFFIX_SESSION_DETECTOR" >&2
+    fi
     printf '%s\n' "$KV_TRANSFER_CONFIG"
   elif ((GPU_POLICY)); then
     printf '%s\n' \
@@ -312,6 +352,12 @@ if ((NEEDS_SESSION)); then
 fi
 if ((GPU_POLICY)); then
   echo "GPU eviction: tier_tokens=$VLLM_SUFFIX_EVICTION_TIER_TOKENS tier_step_tokens=$VLLM_SUFFIX_EVICTION_TIER_STEP_TOKENS max_tiers=$VLLM_SUFFIX_EVICTION_MAX_TIERS idle_ttl_s=$VLLM_SUFFIX_EVICTION_IDLE_TTL_S session_dead_ttl_s=$VLLM_SUFFIX_SESSION_DEAD_TTL_S detector=$VLLM_SUFFIX_SESSION_DETECTOR"
+fi
+if [[ -n "$CPU_POLICY" ]]; then
+  echo "CPU eviction: policy=$CPU_POLICY cache_gb=$CPU_CACHE_GB"
+fi
+if [[ -n "$FS_POLICY" ]]; then
+  echo "FS eviction: policy=$FS_POLICY capacity_gb=$FS_CACHE_GB root=$FS_ROOT"
 fi
 printf 'command:'
 printf ' %q' "${COMMAND[@]}"

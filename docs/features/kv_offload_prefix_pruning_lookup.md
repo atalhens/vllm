@@ -361,13 +361,16 @@ leaves plain prefix pruning enabled without session promotion.
 
 From the repository root, [`server.sh`](../../server.sh) provides runnable
 `gpu-prefix`, `gpu-sessions`, and `gpu-sessions-global` profiles, alongside
-CPU/offload profiles. The GPU profiles use the device-cache suffix lookup and
-gap-recompute path and must not be launched with an `OffloadingConnector`.
+CPU/offload profiles. The `cpu-gpu-prefix` and `cpu-gpu-sessions` profiles
+enable GPU pruning together with `OffloadingConnector`'s CPU policy. GPU
+eviction orders local device-cache blocks, while the connector handles
+offloaded CPU/secondary-tier lookups and gap recomputation.
 
-This GPU eviction path is incompatible with KV connectors, speculative
-decoding, context/pipeline parallelism, and encoder-decoder models. The
-connector's own suffix lookup and gap-recompute path remains available when
-GPU suffix-preserving eviction is disabled.
+This GPU eviction path is incompatible with speculative decoding,
+context/pipeline parallelism, and encoder-decoder models. It is supported
+alongside the `OffloadingConnector`; the connector's own suffix lookup and
+gap-recompute path remains available with GPU suffix-preserving eviction
+enabled or disabled.
 
 ---
 
@@ -375,7 +378,6 @@ GPU suffix-preserving eviction is disabled.
 
 - [KV Offloading Usage](kv_offloading_usage.md) — connector config, tiers, basic load/store
 - [Storage-Tier Eviction](kv_offload_storage_eviction.md) — prefix-pruning eviction order and knobs
-- GPU suffix-preserving eviction (`VLLM_SUFFIX_PRESERVING_EVICTION`) — same
-  gap/jump idea on the device cache; incompatible with KV connectors when that
-  GPU feature is enabled, which is why the offload path implements the hole
-  handling inside the connector instead
+- GPU suffix-preserving eviction (`VLLM_SUFFIX_PRESERVING_EVICTION`) — the
+  same prefix-first policy on the device cache. It can run alongside
+  `OffloadingConnector`; the `cpu-gpu-*` profiles in `server.sh` enable both.

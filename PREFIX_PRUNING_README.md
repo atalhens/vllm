@@ -63,10 +63,11 @@ tier-specific**:
 | CPU host memory | Offloading connector's CPU cache policy | `eviction_policy` in `--kv-transfer-config` |
 | Filesystem secondary tier | Bounded FS tier's eviction index | FS `eviction_policy` in `secondary_tiers` |
 
-GPU prefix pruning and the `OffloadingConnector` must be tested as separate
-profiles. The GPU feature currently rejects connector use, while the connector
-path independently supports suffix lookup and gap recomputation across CPU and
-secondary storage tiers.
+GPU prefix pruning and the `OffloadingConnector` can be enabled together.
+GPU eviction orders local free GPU blocks; the connector independently manages
+CPU/secondary-tier copies. Combined operation is exposed as `cpu-gpu-*`
+profiles in `server.sh`. The connector suffix lookup and gap-recomputation
+path remains responsible for suffixes loaded from CPU or secondary storage.
 
 ## 3. Design and lifecycle
 
@@ -195,12 +196,23 @@ Examples:
 # CPU and bounded filesystem tier, both session-aware.
 ./server.sh cpu-fs-sessions 0 8000 <model>
 
-# GPU-only prefix pruning (do not combine with OffloadingConnector).
+# GPU-only prefix pruning.
 ./server.sh gpu-prefix 0 8000 <model>
 
 # GPU-only per-session EWA or global-quantile session detection.
 ./server.sh gpu-sessions 0 8000 <model>
 ./server.sh gpu-sessions-global 0 8000 <model>
+
+# Enable GPU and CPU prefix pruning together, with or without session tracking.
+./server.sh cpu-gpu-prefix 0 8000 <model>
+./server.sh cpu-gpu-sessions 0 8000 <model>
+
+# Enable all three tiers (GPU, CPU, filesystem).
+./server.sh cpu-gpu-fs-sessions 0 8000 <model>
+
+# Run independent implementations concurrently on separate GPUs/ports.
+./server.sh gpu-prefix 0 8000 <model> &
+./server.sh cpu-sessions 1 8001 <model> &
 ```
 
 The second positional argument is the GPU index, and the third is the HTTP
@@ -227,7 +239,7 @@ of the CPU tier.
 
 ### GPU profiles
 
-The GPU profiles set the `VLLM_SUFFIX_*` variables for the server process.
+The GPU and cpu-gpu profiles set the `VLLM_SUFFIX_*` variables for the server process.
 They use `PREFIX_TIER_TOKENS`, `PREFIX_TIER_STEP_TOKENS`,
 `PREFIX_MAX_TIERS`, and `GPU_IDLE_TTL_S`. Session-aware profiles also use
 `SESSION_DEAD_TTL_S`, `SESSION_DETECTOR`, `SESSION_EWA_ALPHA`,
@@ -317,7 +329,8 @@ overrides; see `./server.sh --help`.
 
 ## 7. Limitations and interpretation
 
-- GPU suffix-preserving eviction is incompatible with KV connectors,
+- GPU suffix-preserving eviction can run with `OffloadingConnector`; the
+  `cpu-gpu-*` profiles enable both tiers. It remains incompatible with
   speculative decoding, context/pipeline parallelism, and encoder-decoder
   models in this implementation. The scheduler checks these constraints.
 - GPU and CPU/FS settings are not interchangeable: GPU controls are
@@ -340,16 +353,20 @@ Focused checks on this branch completed:
 - Combined focused CPU/GPU pruning selection: **20 passed**.
 - Scheduler session-arrival and suffix-gap recomputation tests: **2 passed**.
 - Connector suffix-run lookup tests: **5 passed**.
+- Combined connector/GPU suffix-reload variants: **4 passed** with optional
+  Humming detection disabled in the test process. The installed Python 3.14
+  `humming` package is incompatible with this checkout (missing `float4e0m3`)
+  and otherwise breaks the CPU-backend test fixture before test execution.
+  These variants exercise the connector's mocked offload worker with GPU
+  prefix pruning enabled; they are not a live-model serving test.
 - Python compile checks and `git diff --check`: passed.
 
 The larger attempted test selection did not pass as a whole. It included
 unrelated hybrid-cache/configuration failures and Python/environment-dependent
-failures. A dedicated end-to-end offload suffix reload test could not be fully
-validated in the available Python 3.14 environment because an installed
-`humming` package lacks the `float4e0m3` attribute expected during test setup.
-One parameterized case completed, while the other failed during setup. This is
-an environment/test-blocker note, not evidence that the connector's suffix
-lookup unit tests failed; those focused lookup tests passed.
+failures. A live-model server combining the GPU and CPU policies has not been
+launched in this environment. The focused suffix lookup unit tests passed;
+validate the combined profiles with the target runtime and hardware before
+deployment.
 
 Before deployment, run the tests under the repository's supported Python and
 dependency versions, and validate with the target model, connector backend,
@@ -366,6 +383,8 @@ GPU hardware, block size, and memory budgets.
   dead-session promotion.
 - `vllm/v1/core/sched/scheduler.py` — GPU eviction setup and scheduler
   lifecycle integration.
+- `tests/v1/kv_connector/unit/offloading_connector/test_suffix_repro.py` —
+  connector suffix-reload coverage with GPU pruning both disabled and enabled.
 - `vllm/v1/kv_offload/eviction/prefix_pruning_core.py` — shared CPU/FS scoring
   and session-liveness primitives.
 - `vllm/v1/kv_offload/cpu/policies/prefix_pruning.py` — CPU policy variants.
