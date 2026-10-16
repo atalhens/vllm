@@ -538,9 +538,11 @@ def main() -> int:
     else:
         print("Skipping /reset_prefix_cache endpoint call.")
 
+    st_pr = 0
     # 4. Start Profile before starting Round 2
-    print("\n=== STEP 3: Starting Profiler ===")
-    start_profile(args.base_url)
+    if(st_pr):
+        print("\n=== STEP 3: Starting Profiler ===")
+        start_profile(args.base_url)
 
     # 5. Dispatch req-0 first, wait stagger_seconds, then send req-1...
     print("\n=== STEP 4: Replaying req-0 first, then new request(s) ===")
@@ -556,9 +558,10 @@ def main() -> int:
         stagger_seconds=args.stagger_seconds,
     )
 
-    # 6. Stop Profile after Round 2 completes
-    print("\n=== STEP 5: Stopping Profiler & Dumping Traces ===")
-    stop_profile(args.base_url)
+    if(st_pr):
+        # 6. Stop Profile after Round 2 completes
+        print("\n=== STEP 5: Stopping Profiler & Dumping Traces ===")
+        stop_profile(args.base_url)
 
     return 0
 

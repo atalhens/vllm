@@ -1268,7 +1268,7 @@ class OffloadingConnectorScheduler:
             active[source] += delta
             position = boundary
         if envs.VLLM_KV_CONNECTOR_HIT_LOG:
-            logger.info(
+            logger.debug(
                 "Offload source ranges: req_id=%s local=%d requested_external=%d "
                 "accounted=[%d,%d) ranges=%s sources=%s",
                 request.request_id,
