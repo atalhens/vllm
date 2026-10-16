@@ -520,6 +520,31 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_external_cache_hit_sources(
+        self, request: "Request", num_external_tokens: int
+    ) -> dict[str, int]:
+        """Break down an external cache hit by storage tier.
+
+        Called after ``get_num_new_matched_tokens`` so that the scheduler can
+        attribute a request's external prefix-cache hit to the tier(s) that
+        served it (e.g. CPU vs. storage). The breakdown is advisory, used for
+        per-request logging and does not affect scheduling.
+
+        Args:
+            request: the request object.
+            num_external_tokens: the number of externally-cached tokens the
+                connector reported for this request.
+
+        Returns:
+            A mapping from tier medium name (e.g. ``"CPU"``, ``"STORAGE"``) to
+            the number of hit tokens served by that tier. The values sum to
+            ``num_external_tokens``. The default attributes the whole hit to a
+            single ``"EXTERNAL"`` bucket.
+        """
+        if num_external_tokens <= 0:
+            return {}
+        return {"EXTERNAL": num_external_tokens}
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

@@ -402,6 +402,16 @@ class OffloadingManager(ABC):
         """Return collected metrics since last call, or None if disabled."""
         return None
 
+    def get_primary_medium(self) -> Medium | None:
+        """Return the medium that serves lookups, or None if unknown.
+
+        Used for per-request hit-source attribution in logging. A manager that
+        spans multiple tiers (e.g. CPU primary plus a storage secondary) may
+        return the primary tier's medium; precise per-tier attribution is not
+        required.
+        """
+        return getattr(self, "medium", None)
+
     def shutdown(self) -> None:
         """Shutdown the manager and release any resources."""
         return

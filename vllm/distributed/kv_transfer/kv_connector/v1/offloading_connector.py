@@ -165,6 +165,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             max_num_new_tokens=self._max_loadable_tokens(request, num_computed_tokens),
         )
 
+    def get_external_cache_hit_sources(
+        self, request: "Request", num_external_tokens: int
+    ) -> dict[str, int]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_external_cache_hit_sources(
+            request, num_external_tokens
+        )
+
     def get_offload_suffix_hit(
         self, request: "Request"
     ) -> list[tuple[int, int]] | None:

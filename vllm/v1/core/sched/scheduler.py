@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import logging
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -543,6 +544,46 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.get_computed_blocks(request)
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _log_cache_hit_tiers(
+        self,
+        request: Request,
+        num_local_hit_tokens: int,
+        num_external_hit_tokens: int,
+    ) -> None:
+        """Log the per-tier KV cache hit breakdown for a scheduled request.
+
+        ``num_local_hit_tokens`` are served from the on-device (GPU) prefix
+        cache; ``num_external_hit_tokens`` are served by the KV connector and
+        are attributed to their storage tier(s) (e.g. CPU, storage) when the
+        connector can report the breakdown.
+        """
+        if not logger.isEnabledFor(logging.INFO):
+            return
+
+        num_prompt_tokens = request.num_prompt_tokens
+        tiers: list[str] = [f"device={num_local_hit_tokens}"]
+        if self.connector is not None and num_external_hit_tokens > 0:
+            sources = self.connector.get_external_cache_hit_sources(
+                request, num_external_hit_tokens
+            )
+        else:
+            sources = {}
+        if sources:
+            for medium, num_tokens in sources.items():
+                tiers.append(f"{medium.lower()}={num_tokens}")
+        elif num_external_hit_tokens > 0:
+            tiers.append(f"external={num_external_hit_tokens}")
+
+        total_hit = num_local_hit_tokens + num_external_hit_tokens
+        logger.info(
+            "Request %s KV cache hits: %s (total %d/%d prompt tokens, %.1f%%)",
+            request.request_id,
+            ", ".join(tiers),
+            total_hit,
+            num_prompt_tokens,
+            100.0 * total_hit / num_prompt_tokens if num_prompt_tokens else 0.0,
+        )
 
     def _reserve_prefill_lookahead(
         self,
@@ -1169,6 +1210,11 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
+                        self._log_cache_hit_tiers(
+                            request,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed. A streaming-input
@@ -1212,15 +1258,10 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    suffix_hit, num_computed_tokens, num_new_tokens = (
-                        self._limit_new_tokens_to_suffix(
-                            request,
-                            request_id,
-                            suffix_hit,
-                            num_computed_tokens,
-                            num_new_tokens,
+                    if suffix_hit is not None:
+                        num_new_tokens = min(
+                            num_new_tokens, suffix_hit[0][0] - num_computed_tokens
                         )
-                    )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.

@@ -1180,6 +1180,15 @@ class OffloadingConnectorScheduler:
 
         return num_hit_tokens, bool(num_hit_tokens)
 
+    def get_external_cache_hit_sources(
+        self, request: Request, num_external_tokens: int
+    ) -> dict[str, int]:
+        if num_external_tokens <= 0:
+            return {}
+        medium = self.manager.get_primary_medium()
+        label = medium.value if medium is not None else "EXTERNAL"
+        return {label: num_external_tokens}
+
     def take_suffix_hit(self, request_id: str) -> list[tuple[int, int]] | None:
         req_status = self._req_status.get(request_id)
         if req_status is None or not req_status.hit_spans:

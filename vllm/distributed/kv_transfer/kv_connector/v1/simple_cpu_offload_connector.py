@@ -250,6 +250,13 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return 0, False
 
+    def get_external_cache_hit_sources(
+        self, request: "Request", num_external_tokens: int
+    ) -> dict[str, int]:
+        if num_external_tokens <= 0 or self.scheduler_manager is None:
+            return {}
+        return {self.scheduler_manager.kv_event_medium: num_external_tokens}
+
     def update_state_after_alloc(
         self,
         request: "Request",
