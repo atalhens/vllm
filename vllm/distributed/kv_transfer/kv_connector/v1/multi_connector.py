@@ -449,6 +449,19 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return taker(request) if taker is not None else None
 
+    def clip_offload_suffix_hit(
+        self, request: "Request", start: int, end: int
+    ) -> int | None:
+        connector_idx = self._requests_to_connector.get(request.request_id)
+        if connector_idx is None:
+            return 0
+        clip = getattr(
+            self._connectors[connector_idx], "clip_offload_suffix_hit", None
+        )
+        if clip is None:
+            return None
+        return clip(request, start, end)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

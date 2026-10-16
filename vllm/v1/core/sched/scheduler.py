@@ -38,7 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, merge_suffix_spans
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -578,6 +578,78 @@ class Scheduler(SchedulerInterface):
             return None
         return suffix_hits[0][0]
 
+    def _consume_leading_cached_spans(
+        self,
+        request_id: str,
+        suffix_hit: list[tuple[int, int]] | None,
+        num_computed_tokens: int,
+    ) -> tuple[list[tuple[int, int]] | None, int]:
+        """Skip cached spans that already begin at the computed cursor.
+
+        A CPU load is asynchronous, so this has to run again when the request
+        returns to the waiting queue. Without it, a span that starts at token 0
+        budgets zero new tokens and the request stays at the head of the queue.
+        """
+        if not suffix_hit:
+            return None, num_computed_tokens
+        while suffix_hit and num_computed_tokens >= suffix_hit[0][0]:
+            num_computed_tokens = suffix_hit.pop(0)[1]
+        if not suffix_hit:
+            self._suffix_hits.pop(request_id, None)
+            self._offload_suffix_ready.discard(request_id)
+            return None, num_computed_tokens
+        return suffix_hit, num_computed_tokens
+
+    def _clip_cpu_hit_to_gap(
+        self,
+        request: Request,
+        gap_start: int,
+        gap_end: int,
+        ext_tokens: int,
+        load_kv_async: bool,
+    ) -> tuple[int, bool]:
+        """Keep only the CPU hit that falls inside a GPU suffix gap."""
+        if ext_tokens <= 0 or gap_end <= gap_start:
+            self._drop_offload_suffix_hit(request)
+            return 0, False
+        clip = getattr(self.connector, "clip_offload_suffix_hit", None)
+        clipped = clip(request, gap_start, gap_end) if clip is not None else None
+        usable = (
+            min(ext_tokens, gap_end - gap_start) if clipped is None else clipped
+        )
+        if usable <= 0:
+            self._drop_offload_suffix_hit(request)
+            return 0, False
+        return usable, load_kv_async
+
+    def _drop_offload_suffix_hit(self, request: Request) -> None:
+        take = getattr(self.connector, "take_offload_suffix_hit", None)
+        if take is not None:
+            take(request)
+
+    def _limit_new_tokens_to_suffix(
+        self,
+        request: Request,
+        request_id: str,
+        suffix_hit: list[tuple[int, int]] | None,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> tuple[list[tuple[int, int]] | None, int, int]:
+        if suffix_hit is None:
+            return None, num_computed_tokens, num_new_tokens
+        if suffix_hit[0][0] <= num_computed_tokens:
+            suffix_hit, num_computed_tokens = self._consume_leading_cached_spans(
+                request_id, suffix_hit, num_computed_tokens
+            )
+            if num_computed_tokens >= request.num_tokens:
+                num_computed_tokens = max(request.num_tokens - 1, 0)
+            num_new_tokens = request.num_tokens - num_computed_tokens
+        if suffix_hit is not None:
+            num_new_tokens = min(
+                num_new_tokens, suffix_hit[0][0] - num_computed_tokens
+            )
+        return suffix_hit, num_computed_tokens, num_new_tokens
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -948,6 +1020,13 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = 0
                     num_external_computed_tokens = 0
                     did_prefix_cache_lookup = False
+                    suffix_hit, num_computed_tokens = (
+                        self._consume_leading_cached_spans(
+                            request_id, suffix_hit, num_computed_tokens
+                        )
+                    )
+                    if num_computed_tokens >= request.num_tokens:
+                        num_computed_tokens = max(request.num_tokens - 1, 0)
                 elif request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
                     (
@@ -959,12 +1038,16 @@ class Scheduler(SchedulerInterface):
                     suffix_hit = self.kv_cache_manager.get_suffix_hit(
                         new_computed_blocks, num_new_local_computed_tokens
                     )
+                    gpu_suffix: list[tuple[int, int]] | None = None
                     if suffix_hit is not None:
-                        suffix_hit = [suffix_hit]
-                        self._suffix_hits[request_id] = suffix_hit
+                        gpu_suffix = [suffix_hit]
+                        suffix_hit = gpu_suffix
+                        self._suffix_hits[request_id] = gpu_suffix
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None and suffix_hit is None:
+                    # A GPU suffix still consults CPU so a CPU-resident gap can
+                    # be loaded instead of recomputed.
+                    if self.connector is not None:
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
                         # sub-block tail without racing its copy-on-write.
@@ -972,9 +1055,12 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
+                        connector_local = block_aligned_local
+                        if gpu_suffix is not None and partial_tail == 0:
+                            connector_local = num_new_local_computed_tokens
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
-                                request, block_aligned_local
+                                request, connector_local
                             )
                         )
 
@@ -986,7 +1072,16 @@ class Scheduler(SchedulerInterface):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
-                        if partial_tail and ext_tokens > partial_tail:
+                        if gpu_suffix is not None:
+                            ext_tokens, load_kv_async = self._clip_cpu_hit_to_gap(
+                                request,
+                                connector_local,
+                                gpu_suffix[0][0],
+                                ext_tokens,
+                                load_kv_async,
+                            )
+                            num_external_computed_tokens = ext_tokens
+                        elif partial_tail and ext_tokens > partial_tail:
                             # Remote strictly exceeds the full local hit: drop the
                             # sub-block tail so no CoW is needed, and let the load
                             # cover it. Trim the partial block out of the local
@@ -1008,7 +1103,11 @@ class Scheduler(SchedulerInterface):
                         else:
                             num_external_computed_tokens = ext_tokens
 
-                        if hit_diverged and num_external_computed_tokens == 0:
+                        if (
+                            gpu_suffix is None
+                            and hit_diverged
+                            and num_external_computed_tokens == 0
+                        ):
                             # No external tokens back the deeper local hit, so its
                             # resume boundary would have no valid Mamba state.
                             # Reconcile to the boundary every group agrees on.
@@ -1027,8 +1126,13 @@ class Scheduler(SchedulerInterface):
                                 self.connector, "get_offload_suffix_hit", None
                             )
                             if get_offload_suffix_hit is not None:
-                                suffix_hit = get_offload_suffix_hit(request)
-                                if suffix_hit:
+                                cpu_spans = get_offload_suffix_hit(request)
+                                if cpu_spans:
+                                    suffix_hit = (
+                                        merge_suffix_spans([*cpu_spans, *gpu_suffix])
+                                        if gpu_suffix is not None
+                                        else cpu_spans
+                                    )
                                     self._suffix_hits[request_id] = suffix_hit
 
 
@@ -1046,6 +1150,9 @@ class Scheduler(SchedulerInterface):
                         if not suffix_hit:
                             self._suffix_hits.pop(request_id, None)
                             suffix_hit = None
+                    if num_computed_tokens >= request.num_tokens:
+                        # The last token has to be recomputed to produce logits.
+                        num_computed_tokens = max(request.num_tokens - 1, 0)
                     assert num_computed_tokens <= request.num_tokens
 
                     # Skip request with pending mm encoding prefetches
@@ -1070,6 +1177,15 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+                    suffix_hit = self._suffix_hits.get(request_id)
+                    if suffix_hit is not None:
+                        suffix_hit, num_computed_tokens = (
+                            self._consume_leading_cached_spans(
+                                request_id, suffix_hit, num_computed_tokens
+                            )
+                        )
+                        if num_computed_tokens >= request.num_tokens:
+                            num_computed_tokens = max(request.num_tokens - 1, 0)
 
                     if self._ec_transfer_pending(request, num_computed_tokens):
                         request_queue.pop_request()
@@ -1096,8 +1212,15 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    if suffix_hit is not None:
-                        num_new_tokens = min(num_new_tokens, suffix_hit[0] - num_computed_tokens)
+                    suffix_hit, num_computed_tokens, num_new_tokens = (
+                        self._limit_new_tokens_to_suffix(
+                            request,
+                            request_id,
+                            suffix_hit,
+                            num_computed_tokens,
+                            num_new_tokens,
+                        )
+                    )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -3083,8 +3206,12 @@ class Scheduler(SchedulerInterface):
             self._offload_suffix_ready.discard(request.request_id)
         elif offload_suffix:
             self.kv_cache_manager.register_offload_suffix_hit(request, offload_suffix)
+            # A GPU suffix recorded before the CPU load must survive the resume.
+            merged = merge_suffix_spans(
+                [*offload_suffix, *self._suffix_hits.get(request.request_id, [])]
+            )
             request.num_computed_tokens = 0
-            self._suffix_hits[request.request_id] = offload_suffix
+            self._suffix_hits[request.request_id] = merged
             self._offload_suffix_ready.add(request.request_id)
         else:
             # Now that the blocks are ready, actually cache them.

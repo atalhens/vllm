@@ -1558,6 +1558,18 @@ def test_prefix_pruning_lookup_collects_disjoint_full_attention_runs():
     assert spans == [(4, 12), (16, 20)]
 
 
+def test_clip_suffix_hit_keeps_only_the_gpu_gap():
+    spans = [(0, 16), (24, 40), (48, 64)]
+    status = SimpleNamespace(hit_spans=list(spans))
+    sched = object.__new__(OffloadingConnectorScheduler)
+    sched._req_status = {"req": status}
+
+    # 32 is the end of the last in-gap span, including the hole at 16-24.
+    assert sched.clip_suffix_hit("req", 0, 32) == 32
+    assert status.hit_spans == [(0, 16), (24, 32)]
+    assert sched.clip_suffix_hit("plain", 0, 32) is None
+
+
 def test_offload_suffix_hit_can_be_peeked_then_consumed():
     spans = [(8, 12), (16, 20)]
     status = SimpleNamespace(hit_spans=list(spans))

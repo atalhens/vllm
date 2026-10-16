@@ -186,6 +186,26 @@ def test_scheduler_jumps_over_cached_suffix_spans():
     assert "req" not in scheduler._suffix_hits
 
 
+def test_leading_cached_suffix_leaves_a_gap_to_schedule():
+    """A CPU span that starts at token 0 must not budget zero new tokens."""
+    scheduler = object.__new__(Scheduler)
+    scheduler._suffix_hits = {"req": [(0, 8), (16, 24)]}
+    scheduler._offload_suffix_ready = {"req"}
+    request = SimpleNamespace(request_id="req", num_tokens=32)
+
+    spans, computed = scheduler._consume_leading_cached_spans(
+        "req", scheduler._suffix_hits["req"], 0
+    )
+    spans, computed, new_tokens = scheduler._limit_new_tokens_to_suffix(
+        request, "req", spans, computed, request.num_tokens - computed
+    )
+
+    assert computed == 8
+    assert spans == [(16, 24)]
+    assert new_tokens == 8
+    assert "req" in scheduler._suffix_hits
+
+
 def test_finish_request():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)

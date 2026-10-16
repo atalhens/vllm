@@ -16,7 +16,11 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    merge_suffix_spans,
+)
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     MambaManager,
@@ -322,6 +326,8 @@ class KVCacheManager:
         block_size = manager.block_size
         req_id = request.request_id
         boundaries = self.coordinator.get_replay_boundaries(request)
+        existing = list(manager._suffix_hit_reqs.get(req_id, []))
+        cached_before = manager.num_cached_block.get(req_id, 0)
         block_spans = []
         for span_start, span_end in spans:
             assert span_start % block_size == 0 and span_end % block_size == 0
@@ -336,8 +342,12 @@ class KVCacheManager:
                 retention_interval=self.coordinator.retention_interval,
                 replay_boundaries=boundaries,
             )
-        manager.num_cached_block[req_id] = 0
-        manager._suffix_hit_reqs[req_id] = block_spans
+        # Keep a GPU suffix span that was recorded when the gap was allocated.
+        # Restoring the cached-block cursor avoids rehashing the local prefix.
+        manager._suffix_hit_reqs[req_id] = merge_suffix_spans(
+            [*existing, *block_spans]
+        )
+        manager.num_cached_block[req_id] = cached_before
 
     @property
     def usage(self) -> float:

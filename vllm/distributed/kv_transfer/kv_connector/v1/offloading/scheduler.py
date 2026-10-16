@@ -1194,6 +1194,29 @@ class OffloadingConnectorScheduler:
             return None
         return list(req_status.hit_spans)
 
+    def clip_suffix_hit(
+        self, request_id: str, start: int, end: int
+    ) -> int | None:
+        """Intersect a disjoint CPU hit with ``[start, end)``.
+
+        Returns the token count past ``start`` still covered by the clipped
+        spans. ``None`` means the hit is contiguous, so the caller shortens
+        that count itself. ``0`` means no disjoint span remains in the window.
+        """
+        req_status = self._req_status.get(request_id)
+        if req_status is None or not req_status.hit_spans:
+            return None
+        clipped = []
+        for span_start, span_end in req_status.hit_spans:
+            lo = max(span_start, start)
+            hi = min(span_end, end)
+            if hi > lo:
+                clipped.append((lo, hi))
+        req_status.hit_spans = clipped
+        if not clipped:
+            return 0
+        return clipped[-1][1] - start
+
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):

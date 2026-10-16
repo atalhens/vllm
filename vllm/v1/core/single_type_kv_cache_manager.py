@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
@@ -826,13 +827,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             )
             return
 
-        assert num_external_computed_tokens == 0
         assert num_local_computed_tokens % self.block_size == 0
         req_blocks = self.req_to_blocks[request_id]
         assert len(req_blocks) == 0
         gap_end = gap_start
         while gap_end < len(new_computed_blocks) and new_computed_blocks[gap_end].is_null:
             gap_end += 1
+        # External tokens are a CPU load into this gap. The gap blocks allocated
+        # below are their destination, so they must not extend past the suffix.
+        assert num_external_computed_tokens <= (gap_end - gap_start) * self.block_size
         self.block_pool.touch(new_computed_blocks[:gap_start])
         self.block_pool.touch(new_computed_blocks[gap_end:])
         gap_blocks = self.block_pool.get_new_blocks(gap_end - gap_start)

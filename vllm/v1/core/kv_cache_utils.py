@@ -72,6 +72,23 @@ BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 ExternalBlockHash: TypeAlias = bytes | int
 
 
+def merge_suffix_spans(
+    spans: Iterable[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Sort half-open spans and fuse overlaps and abutments."""
+    ordered = sorted((start, end) for start, end in spans if end > start)
+    if not ordered:
+        return []
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def make_block_hash_with_group_id(
     block_hash: BlockHash, group_id: int
 ) -> BlockHashWithGroupId:

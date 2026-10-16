@@ -78,6 +78,18 @@ serve` arguments:
 ./server.sh lru 0 8000 MODEL
 ```
 
+`serve_cpu_gpu.sh` is the same launcher with the CPU and GPU policies chosen
+independently. `cpu-lru-gpu-sessions` is CPU LRU plus GPU session pruning.
+`cpu-sessions-gpu-prefix` is session pruning on CPU and prefix-only pruning
+on GPU. `cpu-prefix-gpu-lru` is CPU prefix pruning with native GPU LRU.
+
+```bash
+./serve_cpu_gpu.sh cpu-lru-gpu-sessions 0 8000 MODEL
+./serve_cpu_gpu.sh cpu-sessions-gpu-prefix 0 8000 MODEL
+./serve_cpu_gpu.sh cpu-prefix-gpu-lru 0 8000 MODEL
+CONFIG_ONLY=1 ./serve_cpu_gpu.sh cpu-sessions-gpu-global
+```
+
 Set `CONFIG_ONLY=1` to print the connector JSON and GPU environment variables
 without starting a server. Set `DRY_RUN=1` to print the resolved command.
 `VLLM_BIN` can point to a CLI installed for this checkout; avoid mixing the
@@ -141,8 +153,10 @@ forwards it.
 - CPU non-contiguous suffix lookup is enabled only for the prefix-pruning CPU
   policies and a single full-attention offload group. Other cache policies
   retain their normal prefix lookup behavior.
-- Mixed CPU+GPU operation uses the GPU suffix hit first when one is already
-  available; otherwise the offload connector can find CPU suffix spans.
+- Mixed CPU+GPU operation uses both hits. When the GPU has a suffix, CPU
+  blocks that fall in the gap before that suffix are loaded, and the scheduler
+  then skips the GPU suffix. `serve_cpu_gpu.sh` starts every CPU policy with
+  every GPU policy.
 - Filesystem/storage-tier prefix scoring from the newer source branch has not
   been ported here. The profiles in this branch intentionally cover CPU and
   GPU, not FS.

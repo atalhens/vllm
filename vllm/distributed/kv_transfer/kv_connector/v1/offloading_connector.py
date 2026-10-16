@@ -177,6 +177,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_suffix_hit(request.request_id)
 
+    def clip_offload_suffix_hit(
+        self, request: "Request", start: int, end: int
+    ) -> int | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.clip_suffix_hit(request.request_id, start, end)
+
     def _max_loadable_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> int | None:
